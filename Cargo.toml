@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/rd-core", "crates/rd-platform", "crates/rd-host", "crates/rd-client", "crates/rd-relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+rd-core = { path = "crates/rd-core" }
+rd-platform = { path = "crates/rd-platform", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Pixel loops are painfully slow unoptimised; keep dev builds usable.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev]
+opt-level = 1

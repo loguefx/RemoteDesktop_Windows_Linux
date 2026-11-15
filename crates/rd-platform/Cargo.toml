@@ -1,0 +1,38 @@
+[package]
+name = "rd-platform"
+description = "Screen capture + input injection backends: Windows (DXGI/GDI + SendInput), X11 (SHM + XTest), Wayland (portal + PipeWire)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wayland"]
+# Wayland support pulls in libpipewire (needs libpipewire-0.3-dev + clang to build).
+wayland = ["dep:ashpd", "dep:pipewire", "dep:tokio"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+rd-core = { path = "../rd-core", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_System_StationsAndDesktops",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["shm", "xtest", "randr", "allow-unsafe-code"] }
+libc = "0.2"
+ashpd = { version = "0.11", optional = true, default-features = false, features = ["tokio"] }
+pipewire = { version = "0.8", optional = true }
+tokio = { workspace = true, optional = true }
+

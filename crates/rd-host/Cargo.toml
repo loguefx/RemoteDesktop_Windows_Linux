@@ -1,0 +1,46 @@
+[package]
+name = "rd-host"
+description = "Remote desktop host: service/daemon (network, auth, users DB) + desktop agent (capture, input)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wayland"]
+wayland = ["rd-platform/wayland"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+rd-core = { workspace = true, features = ["clipboard", "h264", "p2p"] }
+rd-platform = { workspace = true, default-features = false }
+rand = "0.8"
+sha2 = "0.10"
+argon2 = { version = "0.5", features = ["std"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rpassword = "7"
+igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"] }
+socket2 = "0.6"
+if-addrs = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+cpal = "0.15"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Environment",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_Security_Authentication_Identity",
+  "Win32_System_Registry",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,29 @@
+[package]
+name = "rd-client"
+description = "Remote desktop viewer + account/admin CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+rd-core = { workspace = true, features = ["clipboard", "h264", "p2p"] }
+serde_json = "1"
+rpassword = "7"
+if-addrs = "0.13"
+socket2 = "0.6"
+winit = "0.30"
+egui = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui_glow = { version = "0.31", features = ["winit"] }
+glutin = "0.32"
+glutin-winit = "0.5"
+glow = "0.16"
+cpal = "0.15"
+# tokio backend: the Wayland capture code uses ashpd with tokio, and ashpd allows only one.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

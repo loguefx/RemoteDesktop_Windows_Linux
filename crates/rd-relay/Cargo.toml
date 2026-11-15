@@ -1,0 +1,19 @@
+[package]
+name = "rd-relay"
+description = "Relay / rendezvous server: lets clients reach hosts behind NAT; only ever sees end-to-end TLS ciphertext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+rd-core = { path = "../rd-core", default-features = false }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+socket2 = "0.6"
