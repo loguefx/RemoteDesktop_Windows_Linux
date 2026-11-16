@@ -193,6 +193,7 @@ Run `rd-client` and choose **Connect** next to a computer under **My computers**
 In a session:
 
 - **Mouse and keyboard** go to the remote computer while the pointer is over the picture. Physical keys are sent, so the remote keyboard layout applies.
+- **Pointer:** over the picture your pointer takes the remote computer's shape (text I-beam, hand, resize arrows, hidden), scaled with the picture. Windows and X11 hosts send the shape; on Wayland the desktop draws the pointer into the picture, so your own pointer is hidden there instead.
 - **Toolbar:**
   - **Picture** mode:
     - **Smooth** (H.264, the default) is best for video, scrolling and slow connections. The current bitrate is shown next to it.
@@ -209,7 +210,7 @@ In a session:
     with the round-trip time and frames per second
 - **Session ended:** *Reconnect* tries again with the saved sign-in (for example after the remote
   computer went from its login screen to the desktop).
-- **Clipboard:** text and images (screenshots, copied pictures) sync both ways automatically, if your account has the clipboard permission. Images up to 8K resolution are sent as PNG.
+- **Clipboard:** text and images (screenshots, copied pictures) sync both ways automatically, if your account has the clipboard permission: Ctrl+C on one computer, Ctrl+V on the other. On Linux it works on X11 and on Wayland desktops that offer clipboard access to other programs (KDE Plasma, wlroots-based desktops such as Sway or Hyprland); elsewhere, such as GNOME, it goes through XWayland, which may only work while an X11 app has focus. Images up to 8K resolution are sent as PNG.
 - **Copying files:** copy files or folders in Explorer or your file manager on one side and paste them on the other. This needs both the clipboard and files permissions.
   - **How:** copied files are sent along with their contents. The other side saves them in a temporary `rd-clipboard` folder and pastes from there.
   - **Size limit:** up to 32 MiB and 256 files and folders per copy. Use the Files panel for anything bigger.

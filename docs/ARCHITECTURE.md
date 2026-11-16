@@ -129,6 +129,17 @@ other on the local network, and the app remembers how to reach them afterwards.
   adds a Start menu shortcut (`WScript.Shell`) or `/usr/share/applications/rd-remote-desktop.desktop`
   (left alone if a package owns it), and turns on Wake-on-LAN on request.
 
+## Pointer shape
+
+- `Capturer::cursor()` is polled on the capture thread before each capture and returns the
+  pointer's look when it changed: Windows `GetCursorInfo` + `GetIconInfo` (colour, alpha and
+  monochrome AND/XOR cursors; "invert" pixels become black with a white edge), X11 XFixes
+  `GetCursorImage` (by serial, un-premultiplied), Wayland `InPicture` (the portal embeds it).
+- The agent sends `AgentEvent::Cursor`; the daemon keeps the latest for viewers that join and
+  broadcasts `HostMsg::Cursor`. Images are capped at 256×256.
+- The app turns it into a winit custom cursor, scaled with the picture, and sets it after egui's
+  frame whenever the pointer is over the picture; `InPicture`/`Hidden` hide the local pointer.
+
 ## Several viewers on one desktop
 
 All viewers share one agent through a **desk**:
@@ -142,7 +153,7 @@ All viewers share one agent through a **desk**:
 - **Lifetime:** the agent is stopped when the last viewer leaves.
 - **Permissions:** enforced per viewer in the daemon. Input from a view-only account is dropped before it ever reaches the agent.
 
-## Protocol (v6)
+## Protocol (v7)
 
 Messages are postcard-encoded with a `u32` length prefix.
 

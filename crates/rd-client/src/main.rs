@@ -465,7 +465,7 @@ async fn snapshot(auth: Auth, out: std::path::PathBuf, move_mouse: Option<(u32, 
                 }
             }
             HostMsg::Viewers(v) => println!("viewers: {}", v.join(", ")),
-            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } | HostMsg::Pong(_) => {}
+            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } | HostMsg::Pong(_) | HostMsg::Cursor(_) => {}
             HostMsg::Frame(f) => {
                 dec.apply(&f)?;
                 if let (Some((x, y)), false) = (move_mouse, moved) {
@@ -654,6 +654,14 @@ async fn check(auth: Auth, o: CheckOpts) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(o.hold)).await;
         let s = h.state.lock().unwrap();
         println!("viewers now: {}", s.viewers.join(", "));
+        match &s.cursor {
+            Some(rd_core::proto::CursorShape::Image { width, height, hot_x, hot_y, rgba }) => {
+                let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+                println!("pointer: {width}x{height} image, hotspot {hot_x},{hot_y}, {opaque} visible pixels ({} changes)", s.cursor_seq);
+            }
+            Some(other) => println!("pointer: {other:?}"),
+            None => println!("pointer: not reported"),
+        }
         match &s.incoming_clipboard {
             Some(ClipData::Text(t)) => println!("clipboard received from host: {t:?}"),
             Some(c @ ClipData::Image(img)) => {

@@ -354,6 +354,37 @@ impl ClipData {
     }
 }
 
+/// Largest cursor image sent (pixels per side).
+pub const MAX_CURSOR_SIDE: u32 = 256;
+
+/// What the remote mouse pointer looks like. The viewer shows it as its own pointer
+/// while over the picture, so the shape (I-beam, hand, resize arrows...) matches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CursorShape {
+    /// Straight (not premultiplied) RGBA, `width * height * 4` bytes; `hot_*` is the
+    /// pixel that points.
+    Image { width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: Vec<u8> },
+    /// The pointer is hidden on the host (e.g. while typing in some apps).
+    Hidden,
+    /// The host draws the pointer into the picture itself (Wayland): hide the local one.
+    InPicture,
+}
+
+impl CursorShape {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            CursorShape::Image { width, height, hot_x, hot_y, rgba } => {
+                (1..=MAX_CURSOR_SIDE).contains(width)
+                    && (1..=MAX_CURSOR_SIDE).contains(height)
+                    && hot_x < width
+                    && hot_y < height
+                    && rgba.len() == (*width * *height * 4) as usize
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Download chunks in flight before the agent waits for `Ack`s.
 pub const FILE_WINDOW: usize = 8;
 
@@ -402,6 +433,8 @@ pub enum HostMsg {
     Viewers(Vec<String>),
     /// Answer to `Ping`.
     Pong(u64),
+    /// The remote pointer's look changed (also sent when a viewer joins).
+    Cursor(CursorShape),
     /// Session ended by the host.
     Bye(String),
 }
@@ -469,5 +502,7 @@ pub enum AgentEvent {
     Files { client: u32, reply: FileReply },
     /// The person at the host pressed Disconnect: end every session.
     EndSessions,
+    /// The pointer's look changed.
+    Cursor(CursorShape),
     Error(String),
 }

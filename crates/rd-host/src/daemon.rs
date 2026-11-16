@@ -433,6 +433,8 @@ pub(crate) struct Desk {
     status: Mutex<String>,
     process: Mutex<Option<AgentProcess>>,
     audio_on: Mutex<bool>,
+    /// The pointer's current look, for viewers that join later.
+    cursor: Mutex<Option<CursorShape>>,
 }
 
 impl Desk {
@@ -535,6 +537,7 @@ async fn join_desk(shared: &Arc<Shared>) -> Result<Arc<Desk>> {
         status: Mutex::new("starting desktop agent...".into()),
         process: Mutex::new(Some(process)),
         audio_on: Mutex::new(false),
+        cursor: Mutex::new(None),
     });
 
     // daemon -> agent
@@ -589,6 +592,11 @@ async fn join_desk(shared: &Arc<Shared>) -> Result<Arc<Desk>> {
                             let _ = v.tx.send(HostMsg::Files(reply));
                         }
                     }
+                    AgentEvent::Cursor(c) if c.is_valid() => {
+                        *desk.cursor.lock().unwrap() = Some(c.clone());
+                        desk.broadcast(HostMsg::Cursor(c), |_| true);
+                    }
+                    AgentEvent::Cursor(_) => {}
                     AgentEvent::EndSessions => {
                         log::info!("the person at this computer ended the session");
                         shared.db.lock().unwrap().audit(None, "local", "sessions ended from the host screen");
@@ -670,6 +678,9 @@ where
     let _ = tx.send(HostMsg::Status(desk.status.lock().unwrap().clone()));
     if let Some((list, current)) = desk.displays.lock().unwrap().clone() {
         let _ = tx.send(HostMsg::Displays { list, current });
+    }
+    if let Some(c) = desk.cursor.lock().unwrap().clone() {
+        let _ = tx.send(HostMsg::Cursor(c));
     }
     if !perms.control {
         let _ = tx.send(HostMsg::Status("view-only session".into()));

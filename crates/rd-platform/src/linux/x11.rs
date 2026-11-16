@@ -9,10 +9,11 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use crate::{Capturer, Frame, InputInjector, WheelAccumulator};
+use crate::{Capturer, CursorShape, Frame, InputInjector, WheelAccumulator};
 
 /// Origin of the captured monitor on the X screen, shared with the injector.
 type Origin = Arc<Mutex<(i32, i32)>>;
@@ -93,6 +94,9 @@ struct X11Capturer {
     current: u32,
     origin: Origin,
     refreshed: Instant,
+    /// XFixes is available (pointer image), and the serial of the last pointer sent.
+    xfixes: bool,
+    cursor_serial: Option<u32>,
 }
 
 impl X11Capturer {
@@ -111,6 +115,10 @@ impl X11Capturer {
             log::warn!("MIT-SHM unavailable (remote X server?); using slower GetImage");
         }
         let displays = query_displays(&conn, root)?;
+        let xfixes = conn.xfixes_query_version(4, 0).ok().and_then(|c| c.reply().ok()).is_some();
+        if !xfixes {
+            log::info!("XFixes unavailable: viewers see their own pointer shape");
+        }
         let me = Self {
             conn,
             root,
@@ -122,6 +130,8 @@ impl X11Capturer {
             current: 0,
             origin,
             refreshed: Instant::now(),
+            xfixes,
+            cursor_serial: None,
         };
         me.publish_origin();
         Ok(me)
@@ -233,6 +243,36 @@ impl Drop for X11Capturer {
 }
 
 impl Capturer for X11Capturer {
+    fn cursor(&mut self) -> Option<CursorShape> {
+        if !self.xfixes {
+            return None;
+        }
+        let r = self.conn.xfixes_get_cursor_image().ok()?.reply().ok()?;
+        if self.cursor_serial == Some(r.cursor_serial) {
+            return None;
+        }
+        self.cursor_serial = Some(r.cursor_serial);
+        let (w, h) = (r.width as u32, r.height as u32);
+        if w == 0 || h == 0 || r.cursor_image.len() < (w * h) as usize {
+            return Some(CursorShape::Hidden);
+        }
+        // Premultiplied ARGB -> straight RGBA.
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for p in &r.cursor_image[..(w * h) as usize] {
+            let a = (p >> 24) as u8;
+            let un = |c: u32| if a == 0 { 0 } else { ((c & 0xFF) * 255 / a as u32).min(255) as u8 };
+            rgba.extend_from_slice(&[un(p >> 16), un(p >> 8), un(*p), a]);
+        }
+        let shape = CursorShape::Image {
+            width: w,
+            height: h,
+            hot_x: (r.xhot as u32).min(w - 1),
+            hot_y: (r.yhot as u32).min(h - 1),
+            rgba,
+        };
+        shape.is_valid().then_some(shape)
+    }
+
     fn capture(&mut self, timeout: Duration) -> Result<Option<&Frame>> {
         // No damage-driven wait: poll at most every ~16 ms. The encoder drops identical
         // frames, so polling only costs a memcpy.

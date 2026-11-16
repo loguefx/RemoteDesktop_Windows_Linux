@@ -25,7 +25,7 @@ use rd_core::keys::{BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
 use rd_core::proto::{DisplayInfo, InputEvent, MouseButton};
 use tokio::sync::mpsc;
 
-use crate::{Capturer, Frame, InputInjector, WheelAccumulator};
+use crate::{Capturer, CursorShape, Frame, InputInjector, WheelAccumulator};
 
 pub fn open() -> Result<(Box<dyn Capturer>, Box<dyn InputInjector>)> {
     let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<PortalStreams>>();
@@ -59,6 +59,8 @@ pub fn open() -> Result<(Box<dyn Capturer>, Box<dyn InputInjector>)> {
         streams: ps.streams,
         index: 0,
         current: current.clone(),
+        // The compositor draws the pointer into the stream (or hides it).
+        cursor_note: Some(if ps.cursor_embedded { CursorShape::InPicture } else { CursorShape::Hidden }),
     };
     cap.start_stream()?;
     Ok((Box::new(cap), Box::new(PortalInjector { tx: input_tx, shared, current })))
@@ -75,6 +77,8 @@ struct StreamInfo {
 struct PortalStreams {
     fd: OwnedFd,
     streams: Vec<StreamInfo>,
+    /// The pointer is drawn into the frames (otherwise it isn't shown at all).
+    cursor_embedded: bool,
 }
 
 fn token_path() -> Option<PathBuf> {
@@ -111,6 +115,7 @@ async fn portal_main(
         let sel = sc
             .select_sources(&session, CursorMode::Embedded, SourceType::Monitor.into(), true, None, PersistMode::DoNot)
             .await;
+        let cursor_embedded = sel.is_ok();
         if sel.is_err() {
             sc.select_sources(&session, CursorMode::Hidden, SourceType::Monitor.into(), true, None, PersistMode::DoNot)
                 .await
@@ -132,7 +137,7 @@ async fn portal_main(
         }
         streams.sort_by_key(|s| s.position.unwrap_or_default());
         let fd = sc.open_pipe_wire_remote(&session).await.context("OpenPipeWireRemote")?;
-        anyhow::Ok((session, PortalStreams { fd, streams }))
+        anyhow::Ok((session, PortalStreams { fd, streams, cursor_embedded }))
     }
     .await;
 
@@ -352,6 +357,8 @@ struct PortalCapturer {
     streams: Vec<StreamInfo>,
     index: u32,
     current: Arc<Mutex<StreamInfo>>,
+    /// How the pointer is shown, reported once.
+    cursor_note: Option<CursorShape>,
 }
 
 impl PortalCapturer {
@@ -386,6 +393,10 @@ impl PortalCapturer {
 }
 
 impl Capturer for PortalCapturer {
+    fn cursor(&mut self) -> Option<CursorShape> {
+        self.cursor_note.take()
+    }
+
     fn capture(&mut self, timeout: Duration) -> Result<Option<&Frame>> {
         let (lock, cv) = (&self.shared.state, &self.shared.cv);
         let st = lock.lock().unwrap();

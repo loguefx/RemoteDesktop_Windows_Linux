@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 pub use rd_core::codec::Frame;
-pub use rd_core::proto::DisplayInfo;
+pub use rd_core::proto::{CursorShape, DisplayInfo};
 use rd_core::proto::{InputEvent, MouseButton};
 
 #[cfg(target_os = "linux")]
@@ -34,6 +34,12 @@ pub trait Capturer: Send {
 
     /// Switch to another monitor. Input injection follows automatically.
     fn select_display(&mut self, index: u32) -> Result<()>;
+
+    /// The pointer's look, if it changed since the last call. Called from the capture
+    /// thread before every capture.
+    fn cursor(&mut self) -> Option<CursorShape> {
+        None
+    }
 }
 
 pub trait InputInjector: Send {

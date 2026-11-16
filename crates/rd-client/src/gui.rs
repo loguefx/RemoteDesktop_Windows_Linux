@@ -767,6 +767,62 @@ impl Gui {
     }
 }
 
+/// What the mouse pointer should look like right now.
+#[derive(Clone)]
+enum WantedCursor {
+    /// The normal local pointer (egui decides).
+    Os,
+    /// Hidden: the remote pointer is drawn into the picture, or hidden on the host.
+    Hidden,
+    /// The remote pointer's shape: (change counter, scale, shape).
+    Remote(u64, f32, Arc<rd_core::proto::CursorShape>),
+}
+
+impl Gui {
+    /// Over the remote picture the pointer takes the remote computer's shape.
+    fn wanted_cursor(&self) -> WantedCursor {
+        let Screen::Session(v) = &self.screen else { return WantedCursor::Os };
+        if !v.remote_hover {
+            return WantedCursor::Os;
+        }
+        let s = v.handle.state.lock().unwrap();
+        if s.closed.is_some() {
+            return WantedCursor::Os;
+        }
+        match &s.cursor {
+            None => WantedCursor::Os,
+            Some(rd_core::proto::CursorShape::Image { .. }) => {
+                // Scale with the picture, so the pointer keeps its size relative to the screen.
+                let scale = match v.image_rect {
+                    Some(r) if v.remote_size.0 > 0 => r.width() * self.ctx.pixels_per_point() / v.remote_size.0 as f32,
+                    _ => 1.0,
+                };
+                WantedCursor::Remote(s.cursor_seq, scale.clamp(0.5, 2.0), Arc::new(s.cursor.clone().unwrap()))
+            }
+            Some(_) => WantedCursor::Hidden,
+        }
+    }
+}
+
+/// RGBA cursor scaled by `scale` (nearest neighbour), with its hotspot.
+fn scaled_cursor(shape: &rd_core::proto::CursorShape, scale: f32) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
+    let rd_core::proto::CursorShape::Image { width, height, hot_x, hot_y, rgba } = shape else { return None };
+    let s = if (scale - 1.0).abs() < 0.15 { 1.0 } else { scale };
+    let (w, h) = (((*width as f32 * s).round() as u32).max(1), ((*height as f32 * s).round() as u32).max(1));
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let sy = ((y as f32 / s) as u32).min(height - 1);
+        for x in 0..w {
+            let sx = ((x as f32 / s) as u32).min(width - 1);
+            let i = ((sy * width + sx) * 4) as usize;
+            out.extend_from_slice(&rgba[i..i + 4]);
+        }
+    }
+    let hx = ((*hot_x as f32 * s) as u32).min(w - 1);
+    let hy = ((*hot_y as f32 * s) as u32).min(h - 1);
+    Some((out, w as u16, h as u16, hx as u16, hy as u16))
+}
+
 impl SessionView {
     fn last_pointer_over_image(&self, _ppp: f32) -> bool {
         // Updated every frame from egui's pointer position (see session_ui).
@@ -2063,6 +2119,10 @@ struct App {
     content: Option<Content>,
     repaint_at: Option<Instant>,
     title: String,
+    /// Remote pointer made into a window cursor: ((change counter, scale), cursor).
+    remote_cursor: Option<((u64, u32), winit::window::CustomCursor)>,
+    /// The pointer is currently overridden (remote shape or hidden).
+    cursor_overridden: bool,
 }
 
 impl App {
@@ -2074,6 +2134,33 @@ impl App {
         if let Content::Main(gui) = content {
             if let Some(fs) = gui.pending_fullscreen.take() {
                 gw.window.set_fullscreen(fs.then_some(winit::window::Fullscreen::Borderless(None)));
+            }
+            // After egui has set its own pointer: over the picture, show the remote one.
+            match gui.wanted_cursor() {
+                WantedCursor::Os => {
+                    if self.cursor_overridden {
+                        self.cursor_overridden = false;
+                        gw.window.set_cursor_visible(true);
+                        gw.window.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                }
+                WantedCursor::Hidden => {
+                    self.cursor_overridden = true;
+                    gw.window.set_cursor_visible(false);
+                }
+                WantedCursor::Remote(seq, scale, shape) => {
+                    let key = (seq, (scale * 100.0) as u32);
+                    if self.remote_cursor.as_ref().is_none_or(|(k, _)| *k != key) {
+                        self.remote_cursor = scaled_cursor(&shape, scale)
+                            .and_then(|(rgba, w, h, hx, hy)| winit::window::CustomCursor::from_rgba(rgba, w, h, hx, hy).ok())
+                            .map(|src| (key, event_loop.create_custom_cursor(src)));
+                    }
+                    if let Some((_, c)) = &self.remote_cursor {
+                        self.cursor_overridden = true;
+                        gw.window.set_cursor_visible(true);
+                        gw.window.set_cursor(c.clone());
+                    }
+                }
             }
         }
         let title = content.title();
@@ -2252,6 +2339,8 @@ fn run_window(rt: tokio::runtime::Runtime, attrs: winit::window::WindowAttribute
         content: None,
         repaint_at: None,
         title: String::new(),
+        remote_cursor: None,
+        cursor_overridden: false,
     };
     {
         // The file dialogs (xdg-desktop-portal on Linux) need a tokio context on this

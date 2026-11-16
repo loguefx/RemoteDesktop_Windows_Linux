@@ -29,7 +29,7 @@ use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CON
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{Capturer, Frame, InputInjector};
+use crate::{Capturer, CursorShape, Frame, InputInjector};
 
 /// Screen rectangle being captured, in virtual-desktop coordinates. Shared so the
 /// injector can map frame pixels to absolute mouse coordinates.
@@ -59,6 +59,7 @@ pub fn open() -> Result<(Box<dyn Capturer>, Box<dyn InputInjector>)> {
             retry_dxgi_at: Instant::now(),
             seed_pending: true,
             desktop: DesktopSync::default(),
+            cursor_last: None,
         }),
         Box::new(WinInjector { rect, desktop: DesktopSync::default() }),
     ))
@@ -163,6 +164,8 @@ struct WinCapturer {
     /// frame can be blank. Seed every new duplication with one GDI grab.
     seed_pending: bool,
     desktop: DesktopSync,
+    /// Last pointer seen: (cursor handle, showing).
+    cursor_last: Option<(isize, bool)>,
 }
 
 impl WinCapturer {
@@ -181,6 +184,12 @@ impl WinCapturer {
 }
 
 impl Capturer for WinCapturer {
+    fn cursor(&mut self) -> Option<CursorShape> {
+        // Same thread as capture, so it follows the input desktop (lock screen, UAC) too.
+        self.desktop.sync(false);
+        poll_cursor(&mut self.cursor_last)
+    }
+
     fn displays(&self) -> Vec<DisplayInfo> {
         self.displays.clone()
     }
@@ -245,6 +254,157 @@ impl Capturer for WinCapturer {
         gdi_capture(rect, &mut self.frame)?;
         std::thread::sleep(timeout.min(Duration::from_millis(15)));
         Ok(Some(&self.frame))
+    }
+}
+
+// ------------------------------------------------------------------ pointer shape
+
+/// The pointer's look, or `None` when it hasn't changed since the last call.
+fn poll_cursor(last: &mut Option<(isize, bool)>) -> Option<CursorShape> {
+    unsafe {
+        let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+        if GetCursorInfo(&mut ci).is_err() {
+            return None;
+        }
+        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
+        let key = (ci.hCursor.0 as isize, showing);
+        if *last == Some(key) {
+            return None;
+        }
+        *last = Some(key);
+        if !showing {
+            return Some(CursorShape::Hidden);
+        }
+        match cursor_image(ci.hCursor) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::debug!("pointer image unavailable: {e:#}");
+                None
+            }
+        }
+    }
+}
+
+/// 32-bit top-down BGRA pixels of a bitmap (monochrome bitmaps come out black/white).
+unsafe fn bitmap_bgra(hbm: HBITMAP) -> Result<(u32, u32, Vec<u8>)> {
+    let mut bm = BITMAP::default();
+    if GetObjectW(hbm, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _)) == 0 {
+        bail!("GetObject failed");
+    }
+    let (w, h) = (bm.bmWidth.max(0) as u32, bm.bmHeight.max(0) as u32);
+    if w == 0 || h == 0 || w > 1024 || h > 2048 {
+        bail!("unexpected cursor bitmap {w}x{h}");
+    }
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    let dc = GetDC(HWND::default());
+    let lines = GetDIBits(dc, hbm, 0, h, Some(buf.as_mut_ptr().cast()), &mut bmi, DIB_RGB_COLORS);
+    ReleaseDC(HWND::default(), dc);
+    if lines == 0 {
+        bail!("GetDIBits failed");
+    }
+    Ok((w, h, buf))
+}
+
+/// RGBA image of a cursor handle: colour cursors (with or without alpha) and classic
+/// monochrome ones (AND/XOR masks; "invert" pixels become black with a white edge).
+unsafe fn cursor_image(cursor: HCURSOR) -> Result<CursorShape> {
+    let mut ii = ICONINFO::default();
+    GetIconInfo(HICON(cursor.0), &mut ii).context("GetIconInfo")?;
+    let r = (|| {
+        let (hot_x, hot_y) = (ii.xHotspot, ii.yHotspot);
+        let (w, h, rgba) = if !ii.hbmColor.is_invalid() {
+            let (w, h, mut px) = bitmap_bgra(ii.hbmColor)?;
+            let has_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+            let mask = if has_alpha { None } else { bitmap_bgra(ii.hbmMask).ok() };
+            for (i, p) in px.chunks_exact_mut(4).enumerate() {
+                p.swap(0, 2); // BGRA -> RGBA
+                if let Some((_, _, m)) = &mask {
+                    // AND mask: white = transparent.
+                    p[3] = if m.get(i * 4).copied().unwrap_or(0) != 0 { 0 } else { 255 };
+                }
+            }
+            (w, h, px)
+        } else {
+            let (w, h2, m) = bitmap_bgra(ii.hbmMask)?;
+            let h = h2 / 2;
+            let n = (w * h) as usize;
+            let and = |i: usize| m[i * 4] != 0;
+            let xor = |i: usize| m[(n + i) * 4] != 0;
+            let mut px = vec![0u8; n * 4];
+            let mut invert = vec![false; n];
+            for i in 0..n {
+                let (r, g, b, a) = match (and(i), xor(i)) {
+                    (false, false) => (0, 0, 0, 255),
+                    (false, true) => (255, 255, 255, 255),
+                    (true, false) => (0, 0, 0, 0),
+                    (true, true) => {
+                        invert[i] = true;
+                        (0, 0, 0, 255)
+                    }
+                };
+                px[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, a]);
+            }
+            // A white edge around "invert" pixels keeps e.g. the text I-beam visible on dark backgrounds.
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let i = (y * w as i32 + x) as usize;
+                    if px[i * 4 + 3] != 0 {
+                        continue;
+                    }
+                    let near = [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().any(|(dx, dy)| {
+                        let (nx, ny) = (x + dx, y + dy);
+                        nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 && invert[(ny * w as i32 + nx) as usize]
+                    });
+                    if near {
+                        px[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+                    }
+                }
+            }
+            (w, h, px)
+        };
+        let shape = CursorShape::Image { width: w, height: h, hot_x: hot_x.min(w - 1), hot_y: hot_y.min(h - 1), rgba };
+        if !shape.is_valid() {
+            bail!("cursor too large ({w}x{h})");
+        }
+        Ok(shape)
+    })();
+    if !ii.hbmColor.is_invalid() {
+        let _ = DeleteObject(ii.hbmColor);
+    }
+    if !ii.hbmMask.is_invalid() {
+        let _ = DeleteObject(ii.hbmMask);
+    }
+    r
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// Reads this desktop's pointer (skipped where there is no interactive desktop).
+    #[test]
+    fn reads_current_pointer() {
+        let mut last = None;
+        match poll_cursor(&mut last) {
+            Some(CursorShape::Image { width, height, rgba, .. }) => {
+                assert!(rgba.chunks_exact(4).any(|p| p[3] > 0), "pointer has visible pixels");
+                println!("pointer {width}x{height}");
+                assert!(poll_cursor(&mut last).is_none(), "unchanged pointer is not reported again");
+            }
+            other => println!("no pointer image here: {other:?}"),
+        }
     }
 }
 

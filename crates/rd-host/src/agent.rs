@@ -178,6 +178,9 @@ fn capture_thread(
     let mut stats = (Instant::now(), 0u32, 0usize);
 
     while !stop.load(Ordering::Relaxed) {
+        if let Some(c) = capturer.cursor() {
+            let _ = events.send(AgentEvent::Cursor(c));
+        }
         if let Some(index) = display_rx.try_iter().last() {
             match capturer.select_display(index) {
                 Ok(()) => {

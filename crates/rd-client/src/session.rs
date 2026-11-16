@@ -68,6 +68,9 @@ pub struct State {
     pub closed: Option<String>,
     /// Latest round-trip time to the host.
     pub rtt_ms: Option<u64>,
+    /// The remote pointer's look, and a counter bumped on every change.
+    pub cursor: Option<rd_core::proto::CursorShape>,
+    pub cursor_seq: u64,
 }
 
 impl State {
@@ -299,6 +302,12 @@ async fn network(
                     s.current_display = current;
                 }
                 HostMsg::Viewers(v) => s.viewers = v,
+                HostMsg::Cursor(c) => {
+                    if c.is_valid() {
+                        s.cursor = Some(c);
+                        s.cursor_seq += 1;
+                    }
+                }
                 HostMsg::Pong(sent) => {
                     s.rtt_ms = Some((epoch.elapsed().as_millis() as u64).saturating_sub(sent));
                     drop(s);
