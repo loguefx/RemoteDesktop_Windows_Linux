@@ -6,6 +6,10 @@
 //!   to forward a TCP port to this computer, and learn the router's public address. The
 //!   app saves that address while it is on the same network, so it can connect later
 //!   from anywhere.
+//! * **Dynamic DNS:** optionally keep a name (e.g. `home.duckdns.org`) pointing at the
+//!   router's address, so the app still finds this computer after the internet provider
+//!   changes that address while you're away.
+//! * **Wake-on-LAN:** the announce carries the network adapters' hardware addresses.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,8 @@ const DESCRIPTION: &str = "RD Remote Desktop";
 #[derive(Default, Clone)]
 pub struct Reach {
     pub public: Option<String>,
+    /// `name:port` when dynamic DNS is set up and the name was updated.
+    pub public_name: Option<String>,
     pub note: Option<String>,
     /// External port currently mapped on the router.
     pub mapped: Option<u16>,
@@ -74,6 +80,7 @@ pub async fn answer_discovery(port: u16, base: Announce, reach: SharedReach) {
         {
             let r = reach.lock().unwrap();
             a.public = r.public.clone();
+            a.public_name = r.public_name.clone();
             a.public_note = r.note.clone();
         }
         if let Some(reply) = discovery::encode_reply(&a) {
@@ -91,13 +98,41 @@ fn bind_discovery(port: u16) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::from_std(s.into())?)
 }
 
-/// Keep a router port mapping for `port` alive and report the public address.
-pub async fn keep_port_mapped(port: u16, reach: SharedReach) {
+/// How often the router is asked again: renews the mapping and notices a changed
+/// internet address quickly (for dynamic DNS).
+const CHECK_EVERY: Duration = Duration::from_secs(300);
+
+/// Keep a router port mapping for `port` alive and report the public address. With
+/// `ddns` = (name, update URL), keep that name pointing at the router's address.
+pub async fn keep_port_mapped(port: u16, reach: SharedReach, ddns: Option<(String, String)>) {
     let mut external: Option<u16> = None;
     let mut last_err = String::new();
+    // Address the dynamic DNS name was last set to, and when.
+    let mut ddns_ip: Option<(IpAddr, std::time::Instant)> = None;
     loop {
         let wait = match map_once(port, &mut external).await {
             Ok((ip, ext, vpn)) => {
+                let mut ddns_note = None;
+                let mut public_name = None;
+                if let (Some((name, url)), false) = (&ddns, discovery::is_non_public(ip)) {
+                    // Update when the address changed, and once a day anyway.
+                    let stale = ddns_ip.is_none_or(|(old, at)| old != ip || at.elapsed() > Duration::from_secs(86_400));
+                    if stale {
+                        match update_ddns(url, ip).await {
+                            Ok(()) => {
+                                log::info!("dynamic DNS: {name} -> {ip}");
+                                ddns_ip = Some((ip, std::time::Instant::now()));
+                            }
+                            Err(e) => {
+                                log::warn!("dynamic DNS update for {name} failed: {e:#}");
+                                ddns_note = Some(format!("couldn't update {name}: {e:#}"));
+                            }
+                        }
+                    }
+                    if ddns_ip.is_some_and(|(old, _)| old == ip) {
+                        public_name = Some(format!("{name}:{ext}"));
+                    }
+                }
                 let (public, note) = if discovery::is_non_public(ip) {
                     (None, Some(format!("your router's internet address {ip} is shared by your provider (carrier-grade NAT), so this computer can't be reached directly from the internet")))
                 } else {
@@ -111,9 +146,10 @@ pub async fn keep_port_mapped(port: u16, reach: SharedReach) {
                         None => log::warn!("{}", note.as_deref().unwrap_or_default()),
                     }
                 }
-                *r = Reach { public, note, mapped: Some(ext) };
+                let note = note.or(ddns_note);
+                *r = Reach { public, public_name, note, mapped: Some(ext) };
                 last_err.clear();
-                Duration::from_secs(LEASE_SECS as u64 / 2)
+                CHECK_EVERY
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -121,12 +157,76 @@ pub async fn keep_port_mapped(port: u16, reach: SharedReach) {
                     log::warn!("router port mapping: {msg}");
                     last_err = msg.clone();
                 }
-                *reach.lock().unwrap() = Reach { public: None, note: Some(msg), mapped: None };
+                *reach.lock().unwrap() = Reach { public: None, public_name: None, note: Some(msg), mapped: None };
                 Duration::from_secs(120)
             }
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// Point the dynamic DNS name at `ip`: fetch the provider's update URL, with `{ip}`
+/// replaced. Providers answer "OK"/"good"/"nochg" on success, "KO"/"bad..."/"911" on errors.
+async fn update_ddns(url: &str, ip: IpAddr) -> anyhow::Result<()> {
+    let r = rd_core::http::get(&url.replace("{ip}", &ip.to_string()), &[]).await?;
+    let body = r.body.trim().to_ascii_lowercase();
+    if r.status != 200 || body.starts_with("ko") || body.starts_with("bad") || body.starts_with("911") || body.starts_with("nohost") {
+        anyhow::bail!("the provider answered {} {}", r.status, r.body.trim().chars().take(80).collect::<String>());
+    }
+    Ok(())
+}
+
+/// Hardware addresses of the wired/wireless adapters, for Wake-on-LAN.
+pub fn mac_addresses() -> Vec<[u8; 6]> {
+    let mut out: Vec<[u8; 6]> = Vec::new();
+    let mut push = |m: [u8; 6]| {
+        // Skip all-zero and locally administered (virtual, VPN, Docker...) addresses.
+        if m != [0; 6] && m[0] & 0x02 == 0 && !out.contains(&m) && out.len() < discovery::MAX_MACS {
+            out.push(m);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+        let mut ifs: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        // Physical adapters have a `device` link; wired ones first ("en..."/"eth...").
+        ifs.retain(|p| p.join("device").exists());
+        ifs.sort_by_key(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            (!(n.starts_with("en") || n.starts_with("eth")), n)
+        });
+        for p in ifs {
+            if let Some(m) = std::fs::read_to_string(p.join("address")).ok().and_then(|s| parse_mac(s.trim())) {
+                push(m);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // getmac: "Connection","Adapter","AA-BB-CC-DD-EE-FF","\\Device\\Tcpip_{...}" or "Media disconnected".
+        if let Ok(o) = std::process::Command::new("getmac").args(["/fo", "csv", "/nh", "/v"]).creation_flags(0x0800_0000).output() {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            let mut rows: Vec<(bool, [u8; 6])> = text
+                .lines()
+                .filter_map(|l| {
+                    let cols: Vec<&str> = l.split("\",\"").map(|c| c.trim_matches('"')).collect();
+                    let mac = parse_mac(cols.get(2)?)?;
+                    let connected = cols.get(3).is_some_and(|t| t.contains("Tcpip"));
+                    Some((connected, mac))
+                })
+                .collect();
+            rows.sort_by_key(|(connected, _)| !connected);
+            for (_, m) in rows {
+                push(m);
+            }
+        }
+    }
+    out
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<u8> = s.split([':', '-']).filter_map(|p| u8::from_str_radix(p, 16).ok()).collect();
+    (parts.len() == 6 && s.len() == 17).then(|| parts.try_into().ok()).flatten()
 }
 
 type Gateway = igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>;

@@ -35,6 +35,23 @@ pub struct Announce {
     pub public_note: Option<String>,
     /// `ID@relay:port`, when the host is registered with a relay.
     pub relay: Option<String>,
+    /// `windows` or `linux`.
+    pub os: String,
+    /// `name:port` of a dynamic DNS name that follows the router's internet address.
+    pub public_name: Option<String>,
+    /// Network adapter hardware addresses, for Wake-on-LAN (at most [`MAX_MACS`]).
+    pub macs: Vec<[u8; 6]>,
+}
+
+pub const MAX_MACS: usize = 3;
+
+/// Wake-on-LAN "magic packet" for `mac`: six 0xFF bytes, then the address 16 times.
+pub fn magic_packet(mac: &[u8; 6]) -> [u8; 102] {
+    let mut p = [0xFFu8; 102];
+    for i in 0..16 {
+        p[6 + i * 6..12 + i * 6].copy_from_slice(mac);
+    }
+    p
 }
 
 pub fn query() -> Vec<u8> {
@@ -60,6 +77,7 @@ pub fn parse_reply(b: &[u8]) -> Option<Announce> {
     }
     let mut a: Announce = postcard::from_bytes(&b[4..]).ok()?;
     a.fingerprint = canonical_fingerprint(&a.fingerprint)?;
+    a.macs.truncate(MAX_MACS);
     (!a.name.is_empty() && a.name.len() <= 64).then_some(a)
 }
 
@@ -117,6 +135,9 @@ mod tests {
             public: Some("203.0.113.9:47800".into()),
             public_note: Some("y".repeat(120)),
             relay: Some(format!("123-456-789@{}:47900", "r".repeat(60))),
+            os: "windows".into(),
+            public_name: Some(format!("{}.duckdns.org:47800", "d".repeat(63))),
+            macs: vec![[0xaa; 6]; MAX_MACS],
         };
         let b = encode_reply(&a).expect("fits");
         assert!(b.len() <= QUERY_LEN);
@@ -125,6 +146,9 @@ mod tests {
         assert!(parse_reply(b"RDA1garbage").is_none());
         assert_eq!(canonical_fingerprint(&"ab".repeat(32)), Some(vec!["AB"; 32].join(":")));
         assert!(canonical_fingerprint("AB:CD").is_none());
+        let p = magic_packet(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

@@ -38,6 +38,49 @@ pub struct Computer {
     /// Pinned fingerprint, saved sign-ins.
     #[serde(default)]
     pub auth: HostEntry,
+    /// Name given on this device ("Rename"); the computer's own name otherwise.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// `windows` or `linux`, from its announce.
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Unix time of the last successful connection from this device.
+    #[serde(default)]
+    pub last_connected: Option<u64>,
+    /// Network adapter addresses, for Wake-on-LAN.
+    #[serde(default)]
+    pub macs: Vec<[u8; 6]>,
+    /// `name:port` of its dynamic DNS name, which follows its internet address.
+    #[serde(default)]
+    pub public_name: Option<String>,
+}
+
+impl Computer {
+    /// What to call it in the list.
+    pub fn label(&self) -> &str {
+        self.alias.as_deref().filter(|a| !a.trim().is_empty()).unwrap_or(&self.name)
+    }
+
+    /// Refresh what the computer announced about itself.
+    pub fn update_from(&mut self, a: &rd_core::discovery::Announce, lan: std::net::SocketAddr) {
+        self.name = a.name.clone();
+        self.lan = Some(lan.to_string());
+        if a.public.is_some() {
+            self.public = a.public.clone();
+        }
+        if a.public_name.is_some() {
+            self.public_name = a.public_name.clone();
+        }
+        if a.relay.is_some() {
+            self.relay = a.relay.clone();
+        }
+        if !a.os.is_empty() {
+            self.os = Some(a.os.clone());
+        }
+        if !a.macs.is_empty() {
+            self.macs = a.macs.clone();
+        }
+    }
 }
 
 impl Store {

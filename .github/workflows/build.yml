@@ -1,0 +1,87 @@
+# Builds and tests on Windows and Linux for every push and pull request.
+# Pushing a tag like v0.2.0 also publishes a GitHub release with ready-to-run downloads
+# (the app's "new version available" note points there).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release --workspace
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "dist/rd-remote-desktop-windows-x64"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/rd-client.exe, target/release/rd-host.exe, target/release/rd-relay.exe, README.md $dir
+          Compress-Archive -Path "$dir/*" -DestinationPath "dist/rd-remote-desktop-windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/rd-remote-desktop-windows-x64.zip
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release --workspace
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Package
+        run: |
+          dir=dist/rd-remote-desktop-linux-x86_64
+          mkdir -p "$dir"
+          cp target/release/rd-client target/release/rd-host target/release/rd-relay README.md "$dir/"
+          tar -C dist -czf dist/rd-remote-desktop-linux-x86_64.tar.gz rd-remote-desktop-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/rd-remote-desktop-linux-x86_64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Windows: unzip and run rd-client.exe. Linux: extract and run ./rd-client (keep rd-host next to it). Then choose Set up remote access."

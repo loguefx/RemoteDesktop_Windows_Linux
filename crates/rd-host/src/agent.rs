@@ -18,7 +18,7 @@ use rd_platform::Backend;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::{audio_cap, clip, files};
+use crate::{audio_cap, clip, files, notice};
 
 pub const TOKEN_ENV: &str = "RD_AGENT_TOKEN";
 
@@ -67,6 +67,8 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
     let clip = clip::spawn(evt_tx.clone());
     files::spawn(file_rx, evt_tx.clone(), opts.impersonate_console_user);
     let mut audio: Option<audio_cap::Capture> = None;
+    // "Your screen is being shared" window on this computer's screen.
+    let mut notice = notice::Notice::new(evt_tx.clone(), opts.impersonate_console_user);
 
     let writer = tokio::spawn(async move {
         loop {
@@ -118,6 +120,7 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
                 AgentCmd::Files { client, req } => {
                     let _ = file_tx.send((client, req));
                 }
+                AgentCmd::Viewers(list) => notice.update(list),
                 AgentCmd::Stop => break,
             }
         }

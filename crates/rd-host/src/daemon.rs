@@ -53,6 +53,9 @@ pub struct Config {
     pub owner: Option<String>,
     /// Ask the router to forward the port (UPnP) for access from the internet.
     pub upnp: bool,
+    /// Dynamic DNS: (name, update URL with `{ip}`), so the app finds this computer after
+    /// the router's internet address changes.
+    pub ddns: Option<(String, String)>,
 }
 
 pub(crate) struct Shared {
@@ -98,9 +101,12 @@ pub async fn serve(cfg: Config, mut shutdown: watch::Receiver<bool>) -> Result<(
             public: None,
             public_note: (!cfg.upnp).then(|| "access from the internet is turned off".to_string()),
             relay: cfg.relay.as_ref().map(|r| format!("{}@{}", r.id, r.addr)),
+            os: std::env::consts::OS.to_string(),
+            public_name: None,
+            macs: crate::reach::mac_addresses(),
         };
         if cfg.upnp {
-            tokio::spawn(crate::reach::keep_port_mapped(addr.port(), reach.clone()));
+            tokio::spawn(crate::reach::keep_port_mapped(addr.port(), reach.clone(), cfg.ddns.clone()));
         } else {
             reach.lock().unwrap().note = base.public_note.clone();
         }
@@ -236,16 +242,28 @@ where
         &peer,
         &format!("login ok ({method}, {:?}){}", hello.mode, if device_token.is_some() { ", device remembered" } else { "" }),
     );
-    log::info!("{peer}: '{}' signed in ({method}, {:?})", user.username, hello.mode);
+    log::info!("{peer}: '{}' signed in from {:?} ({method}, {:?})", user.username, hello.device, hello.mode);
     write_msg(&mut tls, &LoginResult::Ok { user: user.clone(), host_name: shared.host_name.clone(), device_token }).await?;
 
     match hello.mode {
         Mode::Admin => admin_loop(&shared, &user, &mut tls).await,
         Mode::Desktop => {
-            let r = viewer_session(&shared, &user, tls).await;
+            let label = viewer_label(&user.username, &hello.device);
+            let r = viewer_session(&shared, &user, label, tls).await;
             shared.db.lock().unwrap().audit(Some(&user.username), &peer, "session ended");
             r
         }
+    }
+}
+
+/// "owner on Laptop (windows)", for the host's on-screen notice and other viewers.
+fn viewer_label(username: &str, device: &str) -> String {
+    let device: String = device.chars().filter(|c| !c.is_control()).take(60).collect();
+    let device = device.trim();
+    if device.is_empty() {
+        username.to_string()
+    } else {
+        format!("{username} on {device}")
     }
 }
 
@@ -398,7 +416,8 @@ impl Sharpener {
 // ================================================================== desk (shared desktop)
 
 struct Viewer {
-    username: String,
+    /// "user on device".
+    label: String,
     perms: Permissions,
     tx: mpsc::UnboundedSender<HostMsg>,
     audio_tx: mpsc::Sender<AudioChunk>,
@@ -426,9 +445,16 @@ impl Desk {
     }
 
     fn viewer_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.viewers.lock().unwrap().values().map(|v| v.username.clone()).collect();
+        let mut names: Vec<String> = self.viewers.lock().unwrap().values().map(|v| v.label.clone()).collect();
         names.sort();
         names
+    }
+
+    /// Tell every viewer, and the notice on the host's screen, who is connected.
+    fn viewers_changed(&self) {
+        let names = self.viewer_names();
+        let _ = self.agent_tx.send(AgentCmd::Viewers(names.clone()));
+        self.broadcast(HostMsg::Viewers(names), |_| true);
     }
 
     fn update_audio(&self) {
@@ -563,6 +589,11 @@ async fn join_desk(shared: &Arc<Shared>) -> Result<Arc<Desk>> {
                             let _ = v.tx.send(HostMsg::Files(reply));
                         }
                     }
+                    AgentEvent::EndSessions => {
+                        log::info!("the person at this computer ended the session");
+                        shared.db.lock().unwrap().audit(None, "local", "sessions ended from the host screen");
+                        break format!("The person at {} ended the session.", shared.host_name);
+                    }
                     AgentEvent::Error(e) => break format!("host error: {e}"),
                 }
             };
@@ -604,7 +635,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ================================================================== one viewer
 
-async fn viewer_session<S>(shared: &Arc<Shared>, user: &UserInfo, client: S) -> Result<()>
+async fn viewer_session<S>(shared: &Arc<Shared>, user: &UserInfo, label: String, client: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -633,9 +664,9 @@ where
     let (audio_tx, mut audio_rx) = mpsc::channel::<AudioChunk>(16);
     desk.viewers.lock().unwrap().insert(
         id,
-        Viewer { username: user.username.clone(), perms, tx: tx.clone(), audio_tx, wants_audio: false },
+        Viewer { label, perms, tx: tx.clone(), audio_tx, wants_audio: false },
     );
-    desk.broadcast(HostMsg::Viewers(desk.viewer_names()), |_| true);
+    desk.viewers_changed();
     let _ = tx.send(HostMsg::Status(desk.status.lock().unwrap().clone()));
     if let Some((list, current)) = desk.displays.lock().unwrap().clone() {
         let _ = tx.send(HostMsg::Displays { list, current });
@@ -829,6 +860,9 @@ where
                     ClientMsg::SetCodec(c) => {
                         let _ = codec_tx.send(c);
                     }
+                    ClientMsg::Ping(v) => {
+                        let _ = tx.send(HostMsg::Pong(v));
+                    }
                     ClientMsg::Disconnect => break,
                 }
             }
@@ -858,7 +892,7 @@ where
     } else {
         drop(slot);
         desk.update_audio();
-        desk.broadcast(HostMsg::Viewers(desk.viewer_names()), |_| true);
+        desk.viewers_changed();
     }
     log::info!("viewer '{}' left", user.username);
     result.or_else(|e| if is_disconnect(&e) { Ok(()) } else { Err(e) })

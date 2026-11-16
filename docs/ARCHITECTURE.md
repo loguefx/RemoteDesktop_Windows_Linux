@@ -103,6 +103,32 @@ other on the local network, and the app remembers how to reach them afterwards.
 - Device tokens skip both checks and never count as failures, so guessing PINs can't lock
   the owner's devices out.
 
+## Who is connected (host notice)
+
+- The daemon keeps a label per viewer (`user on device`, from `ClientHello.device`) and sends the
+  list to the agent (`AgentCmd::Viewers`) whenever it changes.
+- The agent (`rd-host/src/notice.rs`) starts `rd-client notice --connect 127.0.0.1:PORT` from next to
+  its own binary while the list is non-empty. From the Windows service the agent runs as SYSTEM, so
+  the window is started as the signed-in console user (`WTSQueryUserToken` + `CreateProcessAsUserW`,
+  with that user's environment block).
+- The window proves itself with a one-time token (`RD_NOTICE_TOKEN`), then gets
+  `viewers\t...` lines and answers `disconnect`, which becomes `AgentEvent::EndSessions`: the daemon
+  closes the desk and every viewer gets *The person at NAME ended the session.*
+- It closes when the agent's connection drops. Without `rd-client` installed, Linux uses `notify-send`.
+
+## Dynamic DNS, Wake-on-LAN, app install
+
+- **Dynamic DNS** (`reach::keep_port_mapped`): settings `ddns_host` + `ddns_url` (`{ip}` placeholder).
+  The router is asked every 5 minutes; when its address changes (or once a day) the URL is fetched
+  with `rd_core::http::get`, a minimal HTTPS/1.1 client with the webpki root store. The announce then
+  carries `public_name = name:port`, which the app saves and tries after the LAN and public addresses.
+- **Wake-on-LAN:** the announce carries up to three universally administered MAC addresses (Linux:
+  `/sys/class/net/*` with a `device` link, wired first; Windows: `getmac`). *Wake up* sends the magic
+  packet (6×`FF` + 16×MAC) to every local broadcast address and the computer's /24, UDP 9 and 7.
+- **App install:** `rd-host install` copies `rd-client` from next to itself to the install folder,
+  adds a Start menu shortcut (`WScript.Shell`) or `/usr/share/applications/rd-remote-desktop.desktop`
+  (left alone if a package owns it), and turns on Wake-on-LAN on request.
+
 ## Several viewers on one desktop
 
 All viewers share one agent through a **desk**:
@@ -116,7 +142,7 @@ All viewers share one agent through a **desk**:
 - **Lifetime:** the agent is stopped when the last viewer leaves.
 - **Permissions:** enforced per viewer in the daemon. Input from a view-only account is dropped before it ever reaches the agent.
 
-## Protocol (v5)
+## Protocol (v6)
 
 Messages are postcard-encoded with a `u32` length prefix.
 
@@ -222,6 +248,10 @@ Messages are postcard-encoded with a `u32` length prefix.
 - **H.264 licensing:** OpenH264 is compiled from source here. Cisco's patent licence covers only its own prebuilt binaries, so check what applies before distributing builds. The Windows hardware encoders are licensed through the OS and GPU driver.
 - **Linux hardware encoding:** not implemented (VA-API/NVENC); Linux hosts use OpenH264. Building with `nasm` installed enables OpenH264's assembly, which is faster.
 - **Peer-to-peer** has been tested on one machine (loopback), not across real NATs.
+- **Host notice:** tested with a Linux host in WSL on Xvfb and the Windows client: the window
+  appears with the viewer's name, and its Disconnect button ends the sessions. Not yet tried from
+  the Windows service (the `CreateProcessAsUserW` path), on a real KDE/GNOME desktop, or with
+  dynamic DNS against a real provider and router.
 - **Discovery and setup from the app** were tested between Windows and a Linux host in WSL:
   - **Windows ↔ Linux:** discovery across the WSL virtual network, PIN sign-in, wrong-PIN
     handling, *don't ask again*, offline and reinstalled computers.

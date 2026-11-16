@@ -98,6 +98,33 @@ pub async fn scan(port: u16, wait: Duration) -> Vec<Found> {
     found.into_values().collect()
 }
 
+/// Send Wake-on-LAN magic packets for `macs` to every local network (UDP ports 9 and
+/// 7), and to `lan`'s network if it's known. Only works on the same network as the
+/// sleeping computer.
+pub fn wake(macs: &[[u8; 6]], lan: Option<SocketAddr>) -> std::io::Result<usize> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    s.set_broadcast(true)?;
+    let (_, mut bcast) = interfaces();
+    bcast.push(Ipv4Addr::BROADCAST);
+    if let Some(IpAddr::V4(ip)) = lan.map(|a| a.ip()) {
+        // Assume a /24 for the computer's own network.
+        let o = ip.octets();
+        bcast.push(Ipv4Addr::new(o[0], o[1], o[2], 255));
+    }
+    let mut sent = 0;
+    for mac in macs {
+        let pkt = discovery::magic_packet(mac);
+        for b in &bcast {
+            for port in [9, 7] {
+                if s.send_to(&pkt, (*b, port)).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+    }
+    Ok(sent)
+}
+
 fn bind() -> std::io::Result<UdpSocket> {
     let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     s.set_broadcast(true)?;

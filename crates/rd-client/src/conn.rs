@@ -141,6 +141,10 @@ async fn open_computer(c: &Computer) -> Result<(Stream, String)> {
     if let Some(a) = c.public.as_ref().filter(|p| Some(*p) != c.lan.as_ref()) {
         cands.push((a.clone(), "over the internet"));
     }
+    // A dynamic DNS name still works after the router's address changed.
+    if let Some(a) = &c.public_name {
+        cands.push((a.clone(), "over the internet"));
+    }
     let mut set = tokio::task::JoinSet::new();
     for (i, (addr, label)) in cands.into_iter().enumerate() {
         set.spawn(async move {
@@ -206,6 +210,7 @@ async fn sign_in(mut stream: Stream, entry: &mut HostEntry, mode: Mode, creds: C
         credential,
         remember_device_as: (remember && !used_token).then(device_name),
         mode,
+        device: device_name(),
     };
     write_msg(&mut stream, &hello).await?;
     match read_msg::<_, LoginResult>(&mut stream).await? {
@@ -235,7 +240,11 @@ pub async fn connect_computer(key: &str, mode: Mode, creds: Creds, remember: boo
     let r = sign_in(stream, &mut auth, mode, creds, remember).await?;
     // Reload: a network scan may have updated the addresses meanwhile.
     let mut store = Store::load();
-    store.computers.entry(key.to_string()).or_insert_with(|| c.clone()).auth = auth;
+    let saved = store.computers.entry(key.to_string()).or_insert_with(|| c.clone());
+    saved.auth = auth;
+    if matches!(r, SignIn::Ok { .. }) {
+        saved.last_connected = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+    }
     store.save()?;
     Ok(match r {
         SignIn::Ok { stream, user, host_name } => {

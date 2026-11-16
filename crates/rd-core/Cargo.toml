@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["tls"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:sha2"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:sha2", "dep:webpki-roots"]
 p2p = ["tls", "dep:quinn", "dep:log", "dep:socket2"]
 h264 = ["dep:openh264", "dep:openh264-sys2", "dep:windows", "dep:log"]
 clipboard = ["dep:arboard", "dep:png", "dep:log", "dep:clipboard-win"]
@@ -29,6 +29,8 @@ sha2 = { version = "0.10", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["crypto", "ring", "pem"] }
+# Root certificates for the small HTTPS client (dynamic DNS, update check).
+webpki-roots = { version = "1", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]

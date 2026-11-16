@@ -20,6 +20,7 @@ mod discover;
 mod conn;
 mod gui;
 mod keymap;
+mod notice;
 mod session;
 mod setup;
 
@@ -85,6 +86,12 @@ impl Auth {
 enum Cmd {
     /// List computers on this network that have remote access set up.
     Find,
+    /// (internal) The "your screen is being shared" window, opened by the host service.
+    #[command(hide = true)]
+    Notice {
+        #[arg(long)]
+        connect: String,
+    },
     /// Turn on remote access for this computer, like "Set up remote access" in the app
     /// (asks for administrator rights). The PIN is asked for, or taken from RD_PIN.
     Setup {
@@ -290,6 +297,7 @@ fn main() -> Result<()> {
     };
     match cmd {
         Cmd::Connect { host } => gui::run(rt, Some(host)),
+        Cmd::Notice { connect } => gui::run_notice(rt, &connect),
         Cmd::Setup { name, no_internet, off } => {
             if off {
                 setup::turn_off()?;
@@ -300,7 +308,14 @@ fn main() -> Result<()> {
                 Ok(p) if !p.is_empty() => p,
                 _ => new_secret("PIN", pin_rule)?,
             };
-            let req = setup::SetupRequest { name: name.unwrap_or_else(setup::default_name), pin, internet: !no_internet };
+            let req = setup::SetupRequest {
+                name: name.unwrap_or_else(setup::default_name),
+                pin,
+                internet: !no_internet,
+                ddns: None,
+                ddns_off: false,
+                wake_on_lan: true,
+            };
             setup::validate(&req).map_err(|e| anyhow::anyhow!(e))?;
             setup::set_up(&req)?;
             println!("Remote access is on. This computer is called \"{}\".", req.name.trim());
@@ -316,9 +331,13 @@ fn main() -> Result<()> {
                 println!("{}{}", a.name, if f.local { "  (this computer)" } else { "" });
                 println!("  address:     {}", f.addr);
                 println!("  internet:    {}", a.public.clone().or_else(|| a.public_note.clone()).unwrap_or_else(|| "-".into()));
+                if let Some(n) = &a.public_name {
+                    println!("  name:        {n}");
+                }
                 if let Some(r) = &a.relay {
                     println!("  relay:       {r}");
                 }
+                println!("  system:      {}", a.os);
                 println!("  fingerprint: {}", a.fingerprint);
             }
             Ok(())
@@ -446,7 +465,7 @@ async fn snapshot(auth: Auth, out: std::path::PathBuf, move_mouse: Option<(u32, 
                 }
             }
             HostMsg::Viewers(v) => println!("viewers: {}", v.join(", ")),
-            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } => {}
+            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } | HostMsg::Pong(_) => {}
             HostMsg::Frame(f) => {
                 dec.apply(&f)?;
                 if let (Some((x, y)), false) = (move_mouse, moved) {

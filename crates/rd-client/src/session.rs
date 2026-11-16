@@ -66,6 +66,8 @@ pub struct State {
     pub transfers: Vec<Transfer>,
     pub audio_chunks: u64,
     pub closed: Option<String>,
+    /// Latest round-trip time to the host.
+    pub rtt_ms: Option<u64>,
 }
 
 impl State {
@@ -196,11 +198,15 @@ async fn network(
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
     let (mut rd, mut wr) = tokio::io::split(session.stream);
+    // Round-trip time: a Ping every 2 s carrying the time since `epoch`.
+    let epoch = std::time::Instant::now();
     let writer = async move {
+        let mut ping = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             let msg = tokio::select! {
                 Some(m) = rx.recv() => m,
                 Some(m) = upload_rx.recv() => m,
+                _ = ping.tick() => ClientMsg::Ping(epoch.elapsed().as_millis() as u64),
                 else => break,
             };
             let last = matches!(msg, ClientMsg::Disconnect);
@@ -293,6 +299,11 @@ async fn network(
                     s.current_display = current;
                 }
                 HostMsg::Viewers(v) => s.viewers = v,
+                HostMsg::Pong(sent) => {
+                    s.rtt_ms = Some((epoch.elapsed().as_millis() as u64).saturating_sub(sent));
+                    drop(s);
+                    continue; // nothing to redraw until the UI's next frame
+                }
                 HostMsg::Clipboard(t) => s.incoming_clipboard = Some(t),
                 HostMsg::Audio(chunk) => {
                     s.audio_chunks += 1;

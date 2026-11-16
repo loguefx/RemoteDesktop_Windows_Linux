@@ -10,7 +10,9 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
   - **My computers:** computers on your network show up by themselves; once connected, they stay
     in the list and can be reached from anywhere
   - PIN sign-in, with *don't ask again on this device*
-  - the remote screen with a toolbar
+  - the remote screen with a toolbar (it slides down from the top edge in full screen) and a
+    connection badge: direct or relay, round-trip time, frames per second
+  - **Wake up** for sleeping computers (Wake-on-LAN), **rename on this device**, last-connected times
   - a file panel
   - an accounts screen
   - a CLI for scripting
@@ -23,14 +25,28 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
   - the first account created is always the admin
 - **Sign-in** is by PIN (4-12 digits) or password. A saved device token ("don't ask again on this
   device") signs you in automatically after that.
-- **Several viewers** can share one desktop at the same time.
+- **Several viewers** can share one desktop at the same time. While anyone is connected, the host's
+  screen shows a small *Your screen is being shared* window naming each viewer, with a
+  **Disconnect** button for the person at the computer.
+- **Dynamic DNS** (optional, e.g. a free DuckDNS name) keeps a computer reachable from outside after
+  the internet provider changes its home address.
 - **Video** is H.264 by default, with a bitrate that adapts to the connection. On Windows the GPU's
   hardware encoder (NVIDIA, AMD or Intel) does the work when there is one. Still parts of the
   screen are then resent losslessly, so text ends up pixel-exact. A lossless-only mode is one click away.
 - **Linux** supports **X11** (MIT-SHM + XTest + RandR) and **Wayland** (xdg-desktop-portal +
   PipeWire). The right one is picked for each session automatically.
 
-## Build
+## Download or build
+
+**Ready-made downloads:** each version tag (`v0.2.0`, ...) builds Windows and Linux packages on
+GitHub Actions and publishes them under **Releases**. Unzip and run `rd-client`, with `rd-host` next
+to it. The app checks GitHub for a newer release when it starts and shows a *Download* link; set
+`RD_NO_UPDATE_CHECK=1` to turn that off.
+
+**Arch / CachyOS / Manjaro:** `cd packaging/arch && makepkg -si` builds and installs a package from
+the latest source, with an application-menu entry.
+
+**From source:**
 
 ```bash
 cargo build --release
@@ -68,6 +84,9 @@ For host audio on Linux, install `pulseaudio-utils` (it provides `parec`; works 
    - **PIN:** at least 4 digits. You'll type it when you connect from another device.
    - **Allow connections from outside this network:** asks your router to forward a port (UPnP)
      so you can connect from anywhere.
+   - **Keep working when your internet address changes** (optional): a free DuckDNS name and token.
+   - **Wake-on-LAN:** lets your other devices wake this computer from sleep.
+   - The app is also installed for everyone (Start menu / application menu), next to the service.
    - Windows asks for administrator permission (UAC) and Linux for your password (polkit);
      the app then installs and starts the background service.
 3. On another device on the same network, open `rd-client`. The computer appears under
@@ -82,7 +101,10 @@ For host audio on Linux, install `pulseaudio-utils` (it provides `parec`; works 
 - **Router:** UPnP must be on (most home routers have it on). `rd-host router-check` tells you
   whether the router answers, changing nothing.
 - **Changing home IP:** the internet address is refreshed each time your device is on the same
-  network as the computer. If your provider changes your address while you are away, use a relay
+  network as the computer. If your provider changes it while you are away, a dynamic DNS name
+  still finds the computer: sign in at [duckdns.org](https://www.duckdns.org), add a name, and enter
+  it with your token under *Keep working when your internet address changes*. The host checks the
+  router's address every 5 minutes and updates the name when it changes. Without one, use a relay
   (below) or reconnect once from home.
 - **Carrier-grade NAT** (some mobile and fibre providers share one address between customers):
   no port can be forwarded; the app says so under *This computer*. Use a relay.
@@ -135,14 +157,18 @@ Options:
 | `--name NAME` | computer name | Name shown in the app |
 | `--owner USER` + `--pin-file FILE` | – | PIN-only owner account (the file is deleted after reading) |
 | `--upnp` | off | Forward the port on the router (UPnP) for access from the internet |
+| `--ddns-file FILE` | – | Dynamic DNS: two lines, the name and an `https://` update URL containing `{ip}` (any provider; the app fills in DuckDNS). Deleted after reading |
+| `--ddns-off` | – | Stop updating the dynamic DNS name |
+| `--wake-on-lan` | off | Let the network adapters wake the computer (Windows: adapter power settings; Linux: NetworkManager wired connections) |
+| `--no-app` | – | Don't install the app next to the service or add the menu entry |
 | `--result-file FILE` | – | Write `ok` or `error: ...` when done (the app reads this) |
 | `--relay HOST[:PORT]` | – | Also register with a relay (see below) |
 | `--relay-only` | – | Accept connections only through the relay; no listening port |
 | `--no-firewall` | – | Don't open firewall ports |
 | `--admin-user NAME` | – | Admin username for unattended installs; the password comes from `RD_ADMIN_PASSWORD` |
 
-`rd-host uninstall [--purge]` removes the service and closes the firewall ports. `--purge` also deletes
-the users and keys. **Turn off** in the app does the same without `--purge`, so setting it up again keeps
+`rd-host uninstall [--purge]` removes the service and closes the firewall ports, and keeps the app.
+`--purge` also deletes the users and keys, the app and its menu entry. **Turn off** in the app does the same without `--purge`, so setting it up again keeps
 the same certificate and your devices' saved sign-ins.
 
 ## Connect
@@ -152,7 +178,11 @@ Run `rd-client` and choose **Connect** next to a computer under **My computers**
 - **Sign in:** with the computer's PIN. *Use a username and password instead* signs in as another
   account on that computer (see *Users and permissions*). Leave *Don't ask again on this device*
   on, and next time the app signs you in automatically.
-- **Menu (...) next to a computer:** *Manage accounts*, *Sign out on this device*, *Remove from my computers*.
+- **Menu (...) next to a computer:** *Wake up* (when it's asleep), *Rename on this device*, *Manage accounts*,
+  *Sign out on this device*, *Remove from my computers*.
+- **Wake up** sends a Wake-on-LAN packet to the hardware addresses the computer announced. It works
+  from the same network as the computer, and needs Wake-on-LAN on in its firmware (BIOS/UEFI) too.
+  On Windows, *fast startup* can stop a computer that is shut down (not asleep) from waking.
 - **By address:** `rd-client connect 192.168.1.20:47800` or `rd-client connect 482-913-077@relay.example.com`
   opens the app connected to an address. The first time, it shows the host's certificate
   fingerprint to compare with `rd-host info` on that computer; after that it is pinned (like SSH).
@@ -169,9 +199,13 @@ In a session:
   - **Ctrl+Alt+Del**
   - **Sound** on/off
   - **Files**
-  - **Full screen** (F11 to leave)
+  - **Full screen**: move the pointer to the top edge to bring the toolbar back; F11 leaves
   - **Disconnect**
   - who else is connected
+  - **Connection badge:** *Direct · this network*, *Direct · internet*, *Peer-to-peer* or *Relay*,
+    with the round-trip time and frames per second
+- **Session ended:** *Reconnect* tries again with the saved sign-in (for example after the remote
+  computer went from its login screen to the desktop).
 - **Clipboard:** text and images (screenshots, copied pictures) sync both ways automatically, if your account has the clipboard permission. Images up to 8K resolution are sent as PNG.
 - **Copying files:** copy files or folders in Explorer or your file manager on one side and paste them on the other. This needs both the clipboard and files permissions.
   - **How:** copied files are sent along with their contents. The other side saves them in a temporary `rd-clipboard` folder and pastes from there.
@@ -271,6 +305,9 @@ Admins always have all four. When a v1 database is upgraded, accounts keep what 
 - **Admin safety:** the last active admin can't be removed, demoted or disabled.
 - **Files on a Windows service install:** file access impersonates the signed-in console user. The service never reads or writes files as SYSTEM, and with nobody signed in, file transfer is refused.
 - **Audit log:** every sign-in and admin action is recorded (`rd-host info` shows the latest entries).
+- **Who is connected:** the host shows a notice window with each viewer's account and device while a
+  session is open; *Disconnect* there ends every session at once (logged in the audit log). On Linux,
+  without the app installed next to rd-host, a desktop notification is shown instead.
 
 ## Diagnostics
 
@@ -304,6 +341,8 @@ Set `RUST_LOG=debug` for more detail.
   - **First session:** a permission dialog appears on the host's own screen and must be approved locally once. Tick every monitor you want to be able to switch between.
   - **After that:** sessions start unattended.
   - **Login screen:** a machine sitting at a Wayland login screen (nobody signed in) can't be captured.
+    With an X11 login screen (SDDM's default) the agent uses the greeter's display.
+    When someone signs in, the session restarts; choose *Reconnect*.
   - **Testing so far:** the Wayland/PipeWire path builds and is unit-tested, but hasn't been run against a real GNOME or KDE session yet.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.

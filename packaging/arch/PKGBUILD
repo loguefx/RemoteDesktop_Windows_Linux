@@ -1,0 +1,56 @@
+# Arch Linux / CachyOS / Manjaro package, built from the latest source on GitHub.
+#
+#   cd packaging/arch && makepkg -si
+#
+# Installs rd-client (the app, with an application-menu entry), rd-host and rd-relay to
+# /usr/bin. Then open "RD Remote Desktop" and choose Set up remote access.
+
+pkgname=rd-remote-desktop-git
+pkgver=r0
+pkgrel=1
+pkgdesc="Self-hosted remote desktop for Windows and Linux (app, host service and relay)"
+arch=('x86_64')
+url="https://github.com/loguefx/RemoteDesktop_Windows_Linux"
+license=('MIT' 'Apache-2.0')
+depends=('pipewire' 'alsa-lib' 'libxkbcommon' 'mesa' 'polkit' 'xdg-desktop-portal')
+makedepends=('git' 'cargo' 'clang' 'pkgconf')
+optdepends=('libpulse: system audio from the host (parec)'
+            'networkmanager: Wake-on-LAN setup')
+provides=('rd-remote-desktop')
+conflicts=('rd-remote-desktop')
+source=("rd::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd rd
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd rd
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked
+}
+
+check() {
+  cd rd
+  cargo test --release --locked --workspace
+}
+
+package() {
+  cd rd
+  install -Dm755 target/release/rd-client "$pkgdir/usr/bin/rd-client"
+  install -Dm755 target/release/rd-host "$pkgdir/usr/bin/rd-host"
+  install -Dm755 target/release/rd-relay "$pkgdir/usr/bin/rd-relay"
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/rd-remote-desktop.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=RD Remote Desktop
+Comment=Connect to your computers
+Exec=/usr/bin/rd-client
+Icon=preferences-desktop-remote-desktop
+Terminal=false
+Categories=Network;RemoteAccess;
+EOF
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

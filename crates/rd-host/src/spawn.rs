@@ -64,6 +64,27 @@ pub struct AgentArgs {
     pub token: String,
 }
 
+/// Start a window for the person at the computer (the "connected" notice). From the
+/// Windows service the agent runs as SYSTEM, so the window is started as the signed-in
+/// console user instead; elsewhere it's a plain child process (same user as the agent).
+pub fn spawn_ui(exe: &std::path::Path, args: &[String], env: &[(String, String)], as_console_user: bool) -> Result<AgentProcess> {
+    #[cfg(windows)]
+    if as_console_user {
+        return Ok(AgentProcess { inner: AgentInner::Handle(win::spawn_as_console_user(exe, args, env)?) });
+    }
+    let _ = as_console_user;
+    let child = std::process::Command::new(exe)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("start {}", exe.display()))?;
+    #[cfg(windows)]
+    return Ok(AgentProcess { inner: AgentInner::Child(child) });
+    #[cfg(not(windows))]
+    return Ok(AgentProcess { child });
+}
+
 pub fn spawn(mode: SpawnMode, a: &AgentArgs) -> Result<AgentProcess> {
     match mode {
         SpawnMode::Child => {
@@ -98,7 +119,8 @@ mod win {
     use windows::Win32::Security::{
         DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TokenPrimary, TokenSessionId, TOKEN_ALL_ACCESS,
     };
-    use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
         CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
@@ -134,6 +156,73 @@ mod win {
             return arg.to_string();
         }
         format!("\"{}\"", arg.replace('"', "\\\""))
+    }
+
+    /// Start `exe` as the user signed in on the console, with that user's environment
+    /// plus `extra`. Needs the SYSTEM token the service gives the agent.
+    pub fn spawn_as_console_user(exe: &std::path::Path, args: &[String], extra: &[(String, String)]) -> Result<OwnedProcess> {
+        unsafe {
+            let mut token = HANDLE::default();
+            WTSQueryUserToken(WTSGetActiveConsoleSessionId(), &mut token).context("nobody is signed in on the console")?;
+            // The user's own environment block: UTF-16 "K=V\0" entries, ending in an empty one.
+            let mut vars: Vec<String> = Vec::new();
+            let mut block: *mut std::ffi::c_void = std::ptr::null_mut();
+            if CreateEnvironmentBlock(&mut block, token, false).is_ok() && !block.is_null() {
+                let mut p = block as *const u16;
+                loop {
+                    let mut len = 0;
+                    while *p.add(len) != 0 {
+                        len += 1;
+                    }
+                    if len == 0 {
+                        break;
+                    }
+                    vars.push(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+                    p = p.add(len + 1);
+                }
+                let _ = DestroyEnvironmentBlock(block);
+            }
+            for (k, v) in extra {
+                vars.push(format!("{k}={v}"));
+            }
+            let mut env: Vec<u16> = Vec::new();
+            for kv in vars {
+                env.extend(kv.encode_utf16());
+                env.push(0);
+            }
+            env.push(0);
+
+            let mut cmd = std::iter::once(quote(&exe.to_string_lossy()))
+                .chain(args.iter().map(|s| quote(s)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            cmd.push('\0');
+            let mut cmd: Vec<u16> = cmd.encode_utf16().collect();
+            let mut desktop = wide("winsta0\\default");
+            let si = STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+                lpDesktop: PWSTR(desktop.as_mut_ptr()),
+                ..Default::default()
+            };
+            let mut pi = PROCESS_INFORMATION::default();
+            let r = CreateProcessAsUserW(
+                token,
+                None,
+                PWSTR(cmd.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT,
+                Some(env.as_ptr() as *const _),
+                None,
+                &si,
+                &mut pi,
+            );
+            let _ = CloseHandle(token);
+            r.context("CreateProcessAsUserW")?;
+            let _ = CloseHandle(pi.hThread);
+            Ok(OwnedProcess(pi.hProcess))
+        }
     }
 
     pub fn spawn_in_console_session(a: &AgentArgs) -> Result<OwnedProcess> {
@@ -288,10 +377,13 @@ mod linux {
                     .filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('=').map(|(k, v)| (k.into(), v.into())))
                     .collect();
                 let has_display = env.contains_key("WAYLAND_DISPLAY") || env.contains_key("DISPLAY");
-                if !has_display || !env.contains_key("DBUS_SESSION_BUS_ADDRESS") {
+                if !has_display {
                     continue;
                 }
-                let score = 1 + (env.get("XDG_SESSION_ID") == Some(&s.id)) as u8;
+                // A login screen (greeter) often has no session bus; still usable on X11.
+                let score = 1
+                    + 2 * env.contains_key("DBUS_SESSION_BUS_ADDRESS") as u8
+                    + (env.get("XDG_SESSION_ID") == Some(&s.id)) as u8;
                 if best.as_ref().map_or(true, |(b, _)| score > *b) {
                     best = Some((score, env));
                 }

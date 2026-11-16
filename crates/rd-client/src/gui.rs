@@ -80,6 +80,11 @@ struct SetupForm {
     pin: String,
     pin2: String,
     internet: bool,
+    /// DuckDNS name (optional), and the one already set up (when changing).
+    ddns_name: String,
+    ddns_was: String,
+    ddns_token: String,
+    wake_on_lan: bool,
     /// Changing the name or PIN of a computer that is already set up.
     change: bool,
     error: Option<String>,
@@ -112,6 +117,14 @@ const SCAN_EVERY: Duration = Duration::from_secs(5);
 
 struct SessionView {
     handle: session::Handle,
+    /// What was connected to, for Reconnect.
+    dest: Dest,
+    /// How the connection runs (see `conn::Session::route`).
+    route: String,
+    /// Frames per second shown in the badge: (since, frames then, rate).
+    fps: (Instant, u64, f32),
+    /// Full screen: the toolbar slid down (pointer at the top edge or on the bar).
+    bar_shown: bool,
     title: String,
     user: UserInfo,
     texture: Option<TextureHandle>,
@@ -179,6 +192,39 @@ pub struct Gui {
     /// Clipboard sync for the active session (runs on its own thread).
     clipboard: Option<(clipboard::Worker, std::sync::mpsc::Receiver<ClipData>)>,
     pending_fullscreen: Option<bool>,
+    /// "Rename on this device": (computer key, text being edited).
+    rename: Option<(String, String)>,
+    /// A newer release: (version, download page).
+    update: Arc<std::sync::Mutex<Option<(String, String)>>>,
+}
+
+/// Where new versions are published.
+const RELEASES_API: &str = "https://api.github.com/repos/loguefx/RemoteDesktop_Windows_Linux/releases/latest";
+
+/// `1.2.10` > `1.2.9`; non-numeric parts count as 0.
+fn newer(candidate: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).take(3).map(|p| p.parse().unwrap_or(0)).collect() };
+    parse(candidate) > parse(current)
+}
+
+/// Ask GitHub for the latest release once per start (set RD_NO_UPDATE_CHECK=1 to skip).
+fn check_for_update(rt: &tokio::runtime::Handle, ctx: egui::Context, out: Arc<std::sync::Mutex<Option<(String, String)>>>) {
+    if std::env::var_os("RD_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    rt.spawn(async move {
+        let r = rd_core::http::get(RELEASES_API, &[("Accept", "application/vnd.github+json")]).await;
+        let Ok(r) = r else { return };
+        if r.status != 200 {
+            return; // no release yet, or the repository is private
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body) else { return };
+        let (Some(tag), Some(url)) = (v["tag_name"].as_str(), v["html_url"].as_str()) else { return };
+        if newer(tag, env!("CARGO_PKG_VERSION")) && url.starts_with("https://github.com/") {
+            *out.lock().unwrap() = Some((tag.trim_start_matches('v').to_string(), url.to_string()));
+            ctx.request_repaint();
+        }
+    });
 }
 
 impl Gui {
@@ -195,7 +241,10 @@ impl Gui {
             pending: None,
             clipboard: None,
             pending_fullscreen: None,
+            rename: None,
+            update: Arc::default(),
         };
+        check_for_update(&g.rt, g.ctx.clone(), g.update.clone());
         if let Some(t) = autoconnect {
             g.start(Attempt { target: Dest::Addr(t), mode: Mode::Desktop, creds: Creds::Saved(None), remember: false });
         }
@@ -287,11 +336,16 @@ impl Gui {
                         format!("{} @ {} · {}", s.user.username, s.host_name, s.route)
                     };
                     let user = s.user.clone();
+                    let route = s.route.clone();
                     let ctx = self.ctx.clone();
                     let handle = session::Handle::start(&self.rt, s, move || ctx.request_repaint());
                     handle.send(ClientMsg::SetCodec(Store::load().video_codec()));
                     self.screen = Screen::Session(Box::new(SessionView {
                         handle,
+                        dest: attempt.target.clone(),
+                        route,
+                        fps: (Instant::now(), 0, 0.0),
+                        bar_shown: false,
                         title,
                         user,
                         texture: None,
@@ -565,6 +619,16 @@ impl Gui {
                 ctx.request_repaint_after(Duration::from_secs(1));
             }
         }
+        if matches!(self.screen, Screen::Home) {
+            if let Some((version, url)) = self.update.lock().unwrap().clone() {
+                egui::TopBottomPanel::top("update").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Version {version} is available."));
+                        ui.hyperlink_to("Download", url);
+                    });
+                });
+            }
+        }
         let mut next: Option<Screen> = None;
         let mut new_attempt: Option<(Attempt, Option<String>)> = None;
         let mut admin: Option<HomeAction> = None;
@@ -572,7 +636,7 @@ impl Gui {
         match &mut self.screen {
             Screen::Home => {
                 let scan = self.scan.lock().unwrap();
-                match home_ui(ctx, &scan, &mut self.notice) {
+                match home_ui(ctx, &scan, &mut self.notice, &mut self.rename) {
                     Some(HomeAction::Connect(a)) => new_attempt = Some((a, None)),
                     Some(a) => admin = Some(a),
                     None => {}
@@ -629,15 +693,16 @@ impl Gui {
                     }
                 }
             }
-            Screen::Session(v) => {
-                if let Some(fs) = session_ui(ctx, v) {
-                    if fs == SessionAction::Close {
-                        next = Some(Screen::Home);
-                    } else if let SessionAction::Fullscreen(on) = fs {
-                        self.pending_fullscreen = Some(on);
-                    }
+            Screen::Session(v) => match session_ui(ctx, v) {
+                Some(SessionAction::Close) => next = Some(Screen::Home),
+                Some(SessionAction::Fullscreen(on)) => self.pending_fullscreen = Some(on),
+                Some(SessionAction::Reconnect) => {
+                    let a = Attempt { target: v.dest.clone(), mode: Mode::Desktop, creds: Creds::Saved(None), remember: false };
+                    self.pending_fullscreen = Some(false);
+                    new_attempt = Some((a, None));
                 }
-            }
+                None => {}
+            },
             Screen::Admin(v) => {
                 if admin_ui(ctx, v) {
                     next = Some(Screen::Home);
@@ -651,10 +716,20 @@ impl Gui {
         match admin {
             Some(HomeAction::OpenSetup(form)) => next = Some(Screen::Setup(form)),
             Some(HomeAction::RunSetup(form)) => {
-                let req = SetupRequest { name: form.name.trim().to_string(), pin: form.pin.clone(), internet: form.internet };
+                // (Checked in setup_ui already.)
+                let (ddns, ddns_off) = setup_ddns(&form).unwrap_or((None, false));
+                let req = SetupRequest {
+                    name: form.name.trim().to_string(),
+                    pin: form.pin.clone(),
+                    internet: form.internet,
+                    ddns,
+                    ddns_off,
+                    wake_on_lan: form.wake_on_lan,
+                };
                 let mut back = form.clone();
                 back.pin.clear();
                 back.pin2.clear();
+                back.ddns_token.clear();
                 let what = if form.change { "Saved." } else { "Remote access is on." };
                 let busy = if cfg!(windows) {
                     "Setting up remote access... approve the Windows administrator prompt."
@@ -703,6 +778,7 @@ impl SessionView {
 enum SessionAction {
     Close,
     Fullscreen(bool),
+    Reconnect,
 }
 
 // ======================================================================== screens
@@ -720,15 +796,10 @@ fn remember_found(found: &[Found]) {
     let mut changed = false;
     for f in found.iter().filter(|f| !f.local) {
         let Some(c) = store.computers.get_mut(&f.announce.fingerprint.to_ascii_lowercase()) else { continue };
-        let lan = Some(f.addr.to_string());
-        let updated = Computer {
-            name: f.announce.name.clone(),
-            lan: lan.clone(),
-            public: f.announce.public.clone().or_else(|| c.public.clone()),
-            relay: f.announce.relay.clone().or_else(|| c.relay.clone()),
-            auth: c.auth.clone(),
-        };
-        if updated.name != c.name || updated.lan != c.lan || updated.public != c.public || updated.relay != c.relay {
+        let mut updated = c.clone();
+        updated.update_from(&f.announce, f.addr);
+        let before = serde_json::to_string(&*c).unwrap_or_default();
+        if serde_json::to_string(&updated).unwrap_or_default() != before {
             *c = updated;
             changed = true;
         }
@@ -747,14 +818,7 @@ fn save_found(f: &Found) -> String {
         auth: HostEntry { fingerprint: Some(f.announce.fingerprint.clone()), ..Default::default() },
         ..Default::default()
     });
-    c.name = f.announce.name.clone();
-    c.lan = Some(f.addr.to_string());
-    if f.announce.public.is_some() {
-        c.public = f.announce.public.clone();
-    }
-    if f.announce.relay.is_some() {
-        c.relay = f.announce.relay.clone();
-    }
+    c.update_from(&f.announce, f.addr);
     let _ = store.save();
     key
 }
@@ -765,7 +829,51 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
-fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, Instant)>) -> Option<HomeAction> {
+/// "5 minutes ago".
+fn ago(unix: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let s = now.saturating_sub(unix);
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match s {
+        0..=59 => "just now".into(),
+        60..=3599 => plural(s / 60, "minute"),
+        3600..=86_399 => plural(s / 3600, "hour"),
+        86_400..=2_591_999 => plural(s / 86_400, "day"),
+        _ => plural(s / 2_592_000, "month"),
+    }
+}
+
+/// A small Windows or Linux mark (drawn, so it doesn't depend on the font's symbols).
+fn os_icon(ui: &mut egui::Ui, os: Option<&str>) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    match os {
+        Some("windows") => {
+            let blue = Color32::from_rgb(0, 120, 215);
+            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let q = egui::Rect::from_center_size(c + egui::vec2(dx * 3.5, dy * 3.5), egui::vec2(6.0, 6.0));
+                p.rect_filled(q, 0.0, blue);
+            }
+            resp.on_hover_text("Windows");
+        }
+        Some("linux") => {
+            // A little penguin: dark body, white belly, orange beak.
+            p.add(egui::Shape::ellipse_filled(c, egui::vec2(5.5, 7.0), Color32::from_gray(40)));
+            p.add(egui::Shape::ellipse_filled(c + egui::vec2(0.0, 2.0), egui::vec2(3.5, 4.5), Color32::from_gray(235)));
+            p.circle_filled(c + egui::vec2(0.0, -3.5), 1.5, Color32::from_rgb(240, 170, 40));
+            resp.on_hover_text("Linux");
+        }
+        _ => {}
+    }
+}
+
+fn home_ui(
+    ctx: &egui::Context,
+    scan: &ScanState,
+    notice: &mut Option<(String, Instant)>,
+    rename: &mut Option<(String, String)>,
+) -> Option<HomeAction> {
     let mut out = None;
     let store = Store::load();
     let green = Color32::from_rgb(90, 170, 90);
@@ -799,10 +907,21 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
                     };
                     ui.horizontal(|ui| {
                         if ui.button("Change name or PIN").clicked() {
+                            let ddns = f
+                                .announce
+                                .public_name
+                                .as_deref()
+                                .and_then(|n| n.rsplit_once(':').map(|(h, _)| h))
+                                .map(|h| h.strip_suffix(setup::DUCKDNS_SUFFIX).unwrap_or(h).to_string())
+                                .unwrap_or_default();
                             out = Some(HomeAction::OpenSetup(SetupForm {
                                 name: f.announce.name.clone(),
                                 pin: String::new(),
                                 pin2: String::new(),
+                                ddns_name: ddns.clone(),
+                                ddns_was: ddns,
+                                ddns_token: String::new(),
+                                wake_on_lan: true,
                                 internet: f.announce.public_note.as_deref() != Some("access from the internet is turned off"),
                                 change: true,
                                 error: None,
@@ -826,6 +945,10 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
                             name: setup::default_name(),
                             pin: String::new(),
                             pin2: String::new(),
+                            ddns_name: String::new(),
+                            ddns_was: String::new(),
+                            ddns_token: String::new(),
+                            wake_on_lan: true,
                             internet: true,
                             change: false,
                             error: None,
@@ -847,7 +970,10 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
         // Saved computers, plus ones found on the network that aren't saved yet.
         struct Row {
             key: String,
+            /// Shown name (renamed on this device, or its own).
             name: String,
+            /// Its own name.
+            real_name: String,
             online: Option<Found>,
             saved: Option<Computer>,
         }
@@ -856,7 +982,8 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
             .iter()
             .map(|(k, c)| Row {
                 key: k.clone(),
-                name: c.name.clone(),
+                name: c.label().to_string(),
+                real_name: c.name.clone(),
                 online: scan.found.iter().find(|f| f.announce.fingerprint.eq_ignore_ascii_case(k)).cloned(),
                 saved: Some(c.clone()),
             })
@@ -864,14 +991,15 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
         for f in &scan.found {
             let k = f.announce.fingerprint.to_ascii_lowercase();
             if !store.computers.contains_key(&k) {
-                rows.push(Row { key: k, name: f.announce.name.clone(), online: Some(f.clone()), saved: None });
+                let n = f.announce.name.clone();
+                rows.push(Row { key: k, name: n.clone(), real_name: n, online: Some(f.clone()), saved: None });
             }
         }
         rows.retain(|r| !r.online.as_ref().is_some_and(|f| f.local));
         // A computer you tried but never got into, and that has gone away, isn't worth listing.
         rows.retain(|r| r.online.is_some() || r.saved.as_ref().is_some_and(|c| c.auth.username.is_some()));
         let online_names: Vec<String> =
-            rows.iter().filter(|r| r.online.is_some()).map(|r| r.name.to_lowercase()).collect();
+            rows.iter().filter(|r| r.online.is_some()).map(|r| r.real_name.to_lowercase()).collect();
         rows.sort_by_key(|r| (r.online.is_none(), r.name.to_lowercase()));
         if rows.is_empty() {
             ui.label(RichText::new(if scan.done_once {
@@ -887,25 +1015,59 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
                     ui.horizontal(|ui| {
                         let (dot, status) = match (&row.online, &row.saved) {
                             (Some(_), _) => (green, "Online on this network".to_string()),
-                            (None, _) if online_names.contains(&row.name.to_lowercase()) => {
+                            (None, _) if online_names.contains(&row.real_name.to_lowercase()) => {
                                 (grey, "Older setup of a computer with this name; remove it from the ... menu".to_string())
                             }
-                            (None, Some(c)) if c.public.is_some() || c.relay.is_some() => {
+                            (None, Some(c)) if c.public.is_some() || c.public_name.is_some() || c.relay.is_some() => {
                                 (grey, "Not on this network; will connect over the internet".to_string())
                             }
                             (None, _) => (grey, "Not found on this network".to_string()),
                         };
                         status_dot(ui, dot);
+                        let os = row
+                            .online
+                            .as_ref()
+                            .map(|f| f.announce.os.clone())
+                            .filter(|o| !o.is_empty())
+                            .or_else(|| row.saved.as_ref().and_then(|c| c.os.clone()));
+                        os_icon(ui, os.as_deref());
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(&row.name).strong());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&row.name).strong());
+                                if row.name != row.real_name {
+                                    ui.label(RichText::new(format!("({})", row.real_name)).small().color(grey));
+                                }
+                            });
                             let auto = row.saved.as_ref().is_some_and(|c| !c.auth.tokens.is_empty());
-                            let extra = if auto { " · signs in automatically" } else { "" };
-                            ui.label(RichText::new(format!("{status}{extra}")).small().color(grey));
+                            let mut line = status.clone();
+                            if auto {
+                                line.push_str(" · signs in automatically");
+                            }
+                            if let Some(t) = row.saved.as_ref().and_then(|c| c.last_connected) {
+                                line.push_str(&format!(" · last connected {}", ago(t)));
+                            }
+                            ui.label(RichText::new(line).small().color(grey));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let saved = row.saved.is_some();
                             if saved {
                                 ui.menu_button("...", |ui| {
+                                    let c = row.saved.as_ref().unwrap();
+                                    if row.online.is_none() && !c.macs.is_empty() {
+                                        if ui.button("Wake up").on_hover_text("Send a Wake-on-LAN signal (works on the same network as the computer)").clicked() {
+                                            let lan = c.lan.as_deref().and_then(|a| a.parse().ok());
+                                            let msg = match discover::wake(&c.macs, lan) {
+                                                Ok(_) => format!("Wake-up signal sent to {}. It can take a minute to start.", row.name),
+                                                Err(e) => format!("Couldn't send the wake-up signal: {e}"),
+                                            };
+                                            *notice = Some((msg, Instant::now()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    if ui.button("Rename on this device").clicked() {
+                                        *rename = Some((row.key.clone(), row.name.clone()));
+                                        ui.close_menu();
+                                    }
                                     if ui.button("Manage accounts").clicked() {
                                         out = Some(HomeAction::Connect(Attempt {
                                             target: Dest::Computer(row.key.clone()),
@@ -950,7 +1112,46 @@ fn home_ui(ctx: &egui::Context, scan: &ScanState, notice: &mut Option<(String, I
             }
         });
     });
+    rename_dialog(ctx, rename);
     out
+}
+
+/// "Rename on this device": a name used only in this device's list.
+fn rename_dialog(ctx: &egui::Context, rename: &mut Option<(String, String)>) {
+    let Some((key, text)) = rename.as_mut() else { return };
+    let (mut save, mut close) = (false, false);
+    egui::Window::new("Rename")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Name shown for this computer on this device only:");
+            let r = ui.add(egui::TextEdit::singleline(text).char_limit(40).desired_width(260.0));
+            focus_if_free(ui, &r);
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                save = true;
+            }
+            ui.horizontal(|ui| {
+                save |= ui.button("Save").clicked();
+                if ui.button("Use its own name").clicked() {
+                    text.clear();
+                    save = true;
+                }
+                close |= ui.button("Cancel").clicked();
+            });
+        });
+    if save {
+        let mut st = Store::load();
+        if let Some(c) = st.computers.get_mut(key.as_str()) {
+            let t = text.trim();
+            c.alias = (!t.is_empty() && t != c.name).then(|| t.to_string());
+            let _ = st.save();
+        }
+        close = true;
+    }
+    if close {
+        *rename = None;
+    }
 }
 
 /// A fixed-width column centred in the window, for dialog-like screens.
@@ -1013,6 +1214,30 @@ fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
                     .small()
                     .color(grey),
             );
+            if f.internet {
+                egui::CollapsingHeader::new("Keep working when your internet address changes (optional)")
+                    .default_open(!f.ddns_was.is_empty())
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Internet providers change home addresses now and then. A free DuckDNS name follows the change, so your devices still find this computer while away. Sign in at duckdns.org, add a name, and copy your token.")
+                                .small()
+                                .color(grey),
+                        );
+                        egui::Grid::new("ddns").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                            ui.label("DuckDNS name");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut f.ddns_name).hint_text("myhome").desired_width(150.0));
+                                ui.label(".duckdns.org");
+                            });
+                            ui.end_row();
+                            ui.label("Token");
+                            let hint = if !f.ddns_was.is_empty() && f.ddns_name.trim() == f.ddns_was { "(unchanged)" } else { "" };
+                            ui.add(egui::TextEdit::singleline(&mut f.ddns_token).password(true).hint_text(hint).desired_width(260.0));
+                            ui.end_row();
+                        });
+                    });
+            }
+            ui.checkbox(&mut f.wake_on_lan, "Let my other devices wake this computer from sleep (Wake-on-LAN)");
             ui.add_space(6.0);
             ui.label(
                 RichText::new("After 5 wrong PINs, sign-in pauses for a while; after 10 the PIN is switched off until you set it again here.")
@@ -1042,7 +1267,7 @@ fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
         });
     });
     if out == Some(true) {
-        let req = SetupRequest { name: f.name.trim().to_string(), pin: f.pin.clone(), internet: f.internet };
+        let req = SetupRequest { name: f.name.trim().to_string(), pin: f.pin.clone(), internet: f.internet, ddns: None, ddns_off: false, wake_on_lan: false };
         if let Err(e) = setup::validate(&req) {
             f.error = Some(e);
             return None;
@@ -1051,8 +1276,28 @@ fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
             f.error = Some("The PINs don't match.".into());
             return None;
         }
+        if let Err(e) = setup_ddns(f) {
+            f.error = Some(e);
+            return None;
+        }
     }
     out
+}
+
+/// The dynamic DNS part of the setup form: (settings to save, turn it off).
+fn setup_ddns(f: &SetupForm) -> Result<(Option<(String, String)>, bool), String> {
+    let typed = f.ddns_name.trim();
+    if !f.internet || typed.is_empty() {
+        return Ok((None, !f.ddns_was.is_empty()));
+    }
+    let sub = setup::duckdns_subdomain(typed)?;
+    if f.ddns_token.trim().is_empty() {
+        if sub == f.ddns_was {
+            return Ok((None, false)); // keep what's set up
+        }
+        return Err("Enter the DuckDNS token too (from duckdns.org).".into());
+    }
+    Ok((Some(setup::duckdns(&sub, &f.ddns_token)?), false))
 }
 
 /// Some(Some(attempt)) = submit, Some(None) = cancel, None = nothing yet.
@@ -1145,7 +1390,6 @@ fn human(n: u64) -> String {
 
 fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction> {
     let mut action = None;
-    let perms = v.user.effective();
     let (status, displays, current, viewers, closed) = {
         let s = v.handle.state.lock().unwrap();
         (s.status.clone(), s.displays.clone(), s.current_display, s.viewers.clone(), s.closed.clone())
@@ -1157,24 +1401,124 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
                 ui.add_space(80.0);
                 ui.heading("Session ended");
                 ui.label(why);
-                if ui.button("Back").clicked() {
-                    action = Some(SessionAction::Close);
-                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() - 170.0).max(0.0) / 2.0);
+                    if ui.button("Reconnect").clicked() {
+                        action = Some(SessionAction::Reconnect);
+                    }
+                    if ui.button("Back").clicked() {
+                        action = Some(SessionAction::Close);
+                    }
+                });
             });
         });
         return action;
     }
 
+    // Frames per second, for the connection badge.
+    {
+        let frames = v.handle.state.lock().unwrap().video_frames;
+        let dt = v.fps.0.elapsed().as_secs_f32();
+        if dt >= 1.0 {
+            v.fps = (Instant::now(), frames, (frames - v.fps.1) as f32 / dt);
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
     if !v.fullscreen {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            if let Some(a) = toolbar(ui, v, &status, &displays, current, &viewers) {
+                action = Some(a);
+            }
+        });
+    } else {
+        // Full screen: the toolbar slides down when the pointer touches the top edge.
+        let at_top = ctx.pointer_latest_pos().is_some_and(|p| p.y <= 3.0);
+        if at_top {
+            v.bar_shown = true;
+        }
+        if v.bar_shown {
+            let screen = ctx.screen_rect();
+            let r = egui::Area::new(egui::Id::new("fs-toolbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(screen.left() + 12.0, screen.top()))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(screen.width() - 40.0);
+                        toolbar(ui, v, &status, &displays, current, &viewers)
+                    })
+                    .inner
+                });
+            if let Some(a) = r.inner {
+                action = Some(a);
+            }
+            // Hide again once the pointer leaves the bar (with a little slack).
+            let keep = ctx.pointer_latest_pos().is_some_and(|p| r.response.rect.expand(24.0).contains(p)) || at_top;
+            if !keep && !ctx.is_using_pointer() {
+                v.bar_shown = false;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            v.fullscreen = false;
+            v.bar_shown = false;
+            action = Some(SessionAction::Fullscreen(false));
+        }
+    }
+    if let Some(SessionAction::Fullscreen(on)) = action {
+        v.fullscreen = on;
+        v.bar_shown = false;
+    }
+
+    if v.show_files && !v.fullscreen {
+        files_panel(ctx, v);
+    }
+    session_picture(ctx, v, &status);
+    action
+}
+
+/// "Direct · this network · 12 ms · 30 fps", with a coloured dot.
+fn connection_badge(ui: &mut egui::Ui, v: &SessionView) {
+    let rtt = v.handle.state.lock().unwrap().rtt_ms;
+    let (kind, color, help) = match v.route.as_str() {
+        "direct" => ("Direct · this network", Color32::from_rgb(90, 170, 90), "Connected straight to the computer on your local network."),
+        "over the internet" => ("Direct · internet", Color32::from_rgb(90, 170, 90), "Connected straight to the computer over the internet (router port forwarding)."),
+        "peer-to-peer" => ("Peer-to-peer", Color32::from_rgb(90, 170, 90), "A direct connection set up through the relay server."),
+        "relayed (UDP)" => ("Relay (UDP)", Color32::from_rgb(220, 170, 60), "Carried by the relay server; a direct path wasn't possible."),
+        _ => ("Relay", Color32::from_rgb(220, 150, 60), "Carried by the relay server over TCP; slower than a direct connection."),
+    };
+    let mut text = kind.to_string();
+    if let Some(ms) = rtt {
+        text.push_str(&format!(" · {ms} ms"));
+    }
+    text.push_str(&format!(" · {:.0} fps", v.fps.2));
+    let r = ui.horizontal(|ui| {
+        status_dot(ui, color);
+        ui.label(RichText::new(text).small());
+    });
+    r.response.on_hover_text(help);
+}
+
+/// The session toolbar (top bar, or the slide-down bar in full screen).
+fn toolbar(
+    ui: &mut egui::Ui,
+    v: &mut SessionView,
+    status: &str,
+    displays: &[rd_core::proto::DisplayInfo],
+    current: u32,
+    viewers: &[String],
+) -> Option<SessionAction> {
+    let mut action = None;
+    let perms = v.user.effective();
+    ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&v.title).strong());
+                connection_badge(ui, v);
                 ui.separator();
                 if displays.len() > 1 && perms.control {
                     let label = |d: &rd_core::proto::DisplayInfo| format!("{} {}x{}", d.name, d.width, d.height);
                     let cur = displays.iter().find(|d| d.index == current).map(label).unwrap_or_default();
                     egui::ComboBox::from_id_salt("display").selected_text(cur).show_ui(ui, |ui| {
-                        for d in &displays {
+                        for d in displays {
                             if ui.selectable_label(d.index == current, label(d)).clicked() {
                                 v.handle.send(ClientMsg::SelectDisplay(d.index));
                             }
@@ -1224,29 +1568,27 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
                         v.handle.list_dir("");
                     }
                 }
-                if ui.button("Full screen").on_hover_text("Press F11 to leave full screen").clicked() {
-                    v.fullscreen = true;
+                if v.fullscreen {
+                    if ui.button("Leave full screen").on_hover_text("Or press F11").clicked() {
+                        action = Some(SessionAction::Fullscreen(false));
+                    }
+                } else if ui.button("Full screen").on_hover_text("Move the pointer to the top edge for this toolbar; F11 leaves full screen").clicked() {
                     action = Some(SessionAction::Fullscreen(true));
                 }
                 if ui.button("Disconnect").clicked() {
                     action = Some(SessionAction::Close);
                 }
                 ui.separator();
-                ui.label(&status);
+                ui.label(status);
                 if viewers.len() > 1 {
-                    ui.label(format!("| viewers: {}", viewers.join(", ")));
+                    ui.label(format!("| connected: {}", viewers.join(", ")));
                 }
-            });
-        });
-    } else if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-        v.fullscreen = false;
-        action = Some(SessionAction::Fullscreen(false));
-    }
+    });
+    action
+}
 
-    if v.show_files && !v.fullscreen {
-        files_panel(ctx, v);
-    }
-
+/// The remote picture, filling the rest of the window.
+fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
     // Upload changed regions of the remote framebuffer into the texture.
     {
         let mut s = v.handle.state.lock().unwrap();
@@ -1296,12 +1638,11 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
             }
             _ => {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new(&status).color(Color32::LIGHT_GRAY));
+                    ui.label(RichText::new(status).color(Color32::LIGHT_GRAY));
                 });
             }
         }
     });
-    action
 }
 
 fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
@@ -1607,6 +1948,17 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
     leave
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_compare() {
+        assert!(super::newer("v0.2.0", "0.1.0"));
+        assert!(super::newer("0.1.10", "0.1.9"));
+        assert!(!super::newer("v0.1.0", "0.1.0"));
+        assert!(!super::newer("0.0.9", "0.1.0"));
+    }
+}
+
 // ======================================================================== window / GL glue
 
 struct GlWindow {
@@ -1617,15 +1969,10 @@ struct GlWindow {
 }
 
 impl GlWindow {
-    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Result<Self> {
+    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop, attrs: winit::window::WindowAttributes) -> Result<Self> {
         use glutin::context::NotCurrentGlContext;
         use glutin::display::{GetGlDisplay, GlDisplay};
         use glutin::prelude::GlSurface;
-        let attrs = winit::window::WindowAttributes::default()
-            .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize { width: 1100.0, height: 700.0 })
-            .with_title("RD Remote Desktop")
-            .with_visible(false);
         let template = glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(None)
             .with_depth_size(0)
@@ -1678,28 +2025,58 @@ enum UserEvent {
     Repaint(Duration),
 }
 
+/// What the window shows: the app, or the host's "screen is being shared" notice.
+enum Start {
+    Main(Option<String>),
+    Notice(crate::notice::Notice),
+}
+
+enum Content {
+    Main(Gui),
+    Notice(crate::notice::Notice),
+}
+
+impl Content {
+    fn ui(&mut self, ctx: &egui::Context) {
+        match self {
+            Content::Main(g) => g.ui(ctx),
+            Content::Notice(n) => n.ui(ctx),
+        }
+    }
+
+    fn title(&self) -> String {
+        match self {
+            Content::Main(g) => g.window_title(),
+            Content::Notice(n) => n.title(),
+        }
+    }
+}
+
 struct App {
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     rt: tokio::runtime::Handle,
-    autoconnect: Option<String>,
+    attrs: winit::window::WindowAttributes,
+    start: Option<Start>,
     gl_window: Option<GlWindow>,
     gl: Option<Arc<glow::Context>>,
     egui_glow: Option<egui_glow::EguiGlow>,
-    gui: Option<Gui>,
+    content: Option<Content>,
     repaint_at: Option<Instant>,
     title: String,
 }
 
 impl App {
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let (Some(gw), Some(eg), Some(gui)) = (self.gl_window.as_mut(), self.egui_glow.as_mut(), self.gui.as_mut()) else {
+        let (Some(gw), Some(eg), Some(content)) = (self.gl_window.as_mut(), self.egui_glow.as_mut(), self.content.as_mut()) else {
             return;
         };
-        eg.run(&gw.window, |ctx| gui.ui(ctx));
-        if let Some(fs) = gui.pending_fullscreen.take() {
-            gw.window.set_fullscreen(fs.then_some(winit::window::Fullscreen::Borderless(None)));
+        eg.run(&gw.window, |ctx| content.ui(ctx));
+        if let Content::Main(gui) = content {
+            if let Some(fs) = gui.pending_fullscreen.take() {
+                gw.window.set_fullscreen(fs.then_some(winit::window::Fullscreen::Borderless(None)));
+            }
         }
-        let title = gui.window_title();
+        let title = content.title();
         if title != self.title {
             gw.window.set_title(&title);
             self.title = title;
@@ -1722,7 +2099,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         if self.gl_window.is_some() {
             return;
         }
-        let gw = match unsafe { GlWindow::new(event_loop) } {
+        let gw = match unsafe { GlWindow::new(event_loop, self.attrs.clone()) } {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("could not create an OpenGL window: {e:#}");
@@ -1743,7 +2120,21 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
         });
         gw.window.set_ime_allowed(false);
-        self.gui = Some(Gui::new(self.rt.clone(), eg.egui_ctx.clone(), self.autoconnect.take()));
+        self.content = Some(match self.start.take() {
+            Some(Start::Notice(n)) => {
+                // Bottom-right corner, clear of the taskbar (the compositor decides on Wayland).
+                if let Some(m) = gw.window.current_monitor() {
+                    let (mp, ms, ws) = (m.position(), m.size(), gw.window.outer_size());
+                    let margin = (24.0 * m.scale_factor()) as i32;
+                    let x = mp.x + ms.width as i32 - ws.width as i32 - margin;
+                    let y = mp.y + ms.height as i32 - ws.height as i32 - margin * 3;
+                    gw.window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
+                }
+                Content::Notice(n)
+            }
+            Some(Start::Main(autoconnect)) => Content::Main(Gui::new(self.rt.clone(), eg.egui_ctx.clone(), autoconnect)),
+            None => Content::Main(Gui::new(self.rt.clone(), eg.egui_ctx.clone(), None)),
+        });
         // Hidden windows never get WM_PAINT on Windows, so show it before the first frame.
         gw.window.set_visible(true);
         gw.window.request_redraw();
@@ -1754,9 +2145,16 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
         match &event {
+            WindowEvent::CloseRequested if matches!(self.content, Some(Content::Notice(_))) => {
+                // The notice stays while someone is connected; Disconnect ends it.
+                if let Some(gw) = &self.gl_window {
+                    gw.window.set_minimized(true);
+                }
+                return;
+            }
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 // Dropping the GUI disconnects any session cleanly.
-                self.gui = None;
+                self.content = None;
                 event_loop.exit();
                 return;
             }
@@ -1772,7 +2170,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             _ => {}
         }
         let (Some(gw), Some(eg)) = (self.gl_window.as_ref(), self.egui_glow.as_mut()) else { return };
-        if let Some(gui) = self.gui.as_mut() {
+        if let Some(Content::Main(gui)) = self.content.as_mut() {
             let ppp = eg.egui_ctx.pixels_per_point();
             let wants_kb = eg.egui_ctx.wants_keyboard_input();
             if gui.remote_input(&event, ppp, wants_kb) {
@@ -1811,7 +2209,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        self.gui = None;
+        self.content = None;
         if let Some(eg) = self.egui_glow.as_mut() {
             eg.destroy();
         }
@@ -1820,15 +2218,38 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
 /// Open the GUI. `autoconnect` immediately connects to a saved/typed target.
 pub fn run(rt: tokio::runtime::Runtime, autoconnect: Option<String>) -> Result<()> {
+    let attrs = winit::window::WindowAttributes::default()
+        .with_resizable(true)
+        .with_inner_size(winit::dpi::LogicalSize { width: 1100.0, height: 700.0 })
+        .with_title("RD Remote Desktop")
+        .with_visible(false);
+    run_window(rt, attrs, Start::Main(autoconnect))
+}
+
+/// The "your screen is being shared" window on the host (`rd-client notice`).
+pub fn run_notice(rt: tokio::runtime::Runtime, connect: &str) -> Result<()> {
+    let notice = crate::notice::Notice::connect(connect)?;
+    let attrs = winit::window::WindowAttributes::default()
+        .with_resizable(false)
+        .with_inner_size(winit::dpi::LogicalSize { width: 380.0, height: 150.0 })
+        .with_title("RD Remote Desktop - screen shared")
+        .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+        .with_enabled_buttons(winit::window::WindowButtons::MINIMIZE)
+        .with_visible(false);
+    run_window(rt, attrs, Start::Notice(notice))
+}
+
+fn run_window(rt: tokio::runtime::Runtime, attrs: winit::window::WindowAttributes, start: Start) -> Result<()> {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let mut app = App {
         proxy: event_loop.create_proxy(),
         rt: rt.handle().clone(),
-        autoconnect,
+        attrs,
+        start: Some(start),
         gl_window: None,
         gl: None,
         egui_glow: None,
-        gui: None,
+        content: None,
         repaint_at: None,
         title: String::new(),
     };

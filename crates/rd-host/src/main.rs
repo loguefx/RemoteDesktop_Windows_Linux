@@ -18,6 +18,7 @@ mod clip;
 mod daemon;
 mod db;
 mod files;
+mod notice;
 mod paths;
 mod prompt;
 mod reach;
@@ -95,6 +96,20 @@ enum Cmd {
         /// Ask the router to forward the port (UPnP) so the app can connect from the internet.
         #[arg(long)]
         upnp: bool,
+        /// Dynamic DNS, so the app finds this computer after the router's internet address
+        /// changes. File with two lines: the name (e.g. home.duckdns.org) and the update URL,
+        /// with {ip} where the address goes. Deleted after reading (the URL holds a secret).
+        #[arg(long, conflicts_with = "ddns_off")]
+        ddns_file: Option<PathBuf>,
+        /// Stop updating a dynamic DNS name.
+        #[arg(long)]
+        ddns_off: bool,
+        /// Let the network adapter wake this computer from sleep (Wake-on-LAN).
+        #[arg(long)]
+        wake_on_lan: bool,
+        /// Don't copy the app (rd-client) or add it to the Start menu / application menu.
+        #[arg(long)]
+        no_app: bool,
         /// Write "ok" or "error: ..." here when done (used by the app, which can't see
         /// the output of an elevated process).
         #[arg(long)]
@@ -136,6 +151,12 @@ enum Cmd {
         /// Forward the port on the router (UPnP): on or off.
         #[arg(long)]
         upnp: Option<String>,
+        /// Dynamic DNS file (name, then update URL with {ip}); deleted after reading.
+        #[arg(long, conflicts_with = "ddns_off")]
+        ddns_file: Option<PathBuf>,
+        /// Stop updating a dynamic DNS name.
+        #[arg(long)]
+        ddns_off: bool,
     },
     /// Check whether the router supports automatic port forwarding (UPnP). Only asks
     /// the router for its internet address; changes nothing.
@@ -284,6 +305,10 @@ pub(crate) fn load_config(data_dir: PathBuf, spawn_mode: spawn::SpawnMode, agent
     let name = get("name").and_then(|n| rd_core::discovery::clean_name(&n)).unwrap_or_else(paths::host_name);
     let owner = get("owner").filter(|o| !o.is_empty());
     let upnp = get("upnp").as_deref() == Some("on");
+    let ddns = match (get("ddns_host").filter(|h| !h.is_empty()), get("ddns_url").filter(|u| !u.is_empty())) {
+        (Some(h), Some(u)) => Some((h, u)),
+        _ => None,
+    };
     Ok(daemon::Config {
         data_dir,
         bind,
@@ -298,7 +323,41 @@ pub(crate) fn load_config(data_dir: PathBuf, spawn_mode: spawn::SpawnMode, agent
         name,
         owner,
         upnp,
+        ddns,
     })
+}
+
+/// Read a dynamic DNS file (name, update URL) and delete it.
+pub(crate) fn read_ddns_file(f: &std::path::Path) -> Result<(String, String)> {
+    let text = std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()));
+    let _ = std::fs::remove_file(f);
+    let text = text?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (Some(host), Some(url)) = (lines.next(), lines.next()) else {
+        anyhow::bail!("the dynamic DNS file needs two lines: the name and the update URL");
+    };
+    let valid_host = host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    if !valid_host {
+        anyhow::bail!("'{host}' isn't a valid name");
+    }
+    if !url.starts_with("https://") || !url.contains("{ip}") {
+        anyhow::bail!("the update URL must start with https:// and contain {{ip}}");
+    }
+    Ok((host.to_ascii_lowercase(), url.to_string()))
+}
+
+/// Save (or with `off`, remove) the dynamic DNS settings.
+pub(crate) fn save_ddns(db: &db::Db, ddns: Option<&(String, String)>, off: bool) -> Result<()> {
+    if off {
+        db.set_setting("ddns_host", "")?;
+        db.set_setting("ddns_url", "")?;
+    } else if let Some((h, u)) = ddns {
+        db.set_setting("ddns_host", h)?;
+        db.set_setting("ddns_url", u)?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -324,10 +383,12 @@ fn main() -> Result<()> {
             // Capture/input threads may be blocked in OS calls; don't wait for them.
             std::process::exit(if r.is_ok() { 0 } else { 1 });
         }
-        Cmd::Run { port, bind, backend, fps, name, owner, pin_file, upnp } => {
+        Cmd::Run { port, bind, backend, fps, name, owner, pin_file, upnp, ddns_file, ddns_off } => {
             init_logging(None);
             {
                 let mut db = db::Db::open(&data_dir)?;
+                let ddns = ddns_file.as_deref().map(read_ddns_file).transpose()?;
+                save_ddns(&db, ddns.as_ref(), ddns_off)?;
                 if let Some(n) = &name {
                     db.set_setting("name", &rd_core::discovery::clean_name(n).context("the name must be 1-40 characters")?)?;
                 }
@@ -383,6 +444,10 @@ fn main() -> Result<()> {
             owner,
             pin_file,
             upnp,
+            ddns_file,
+            ddns_off,
+            wake_on_lan,
+            no_app,
             result_file,
         } => {
             init_logging(None);
@@ -400,6 +465,7 @@ fn main() -> Result<()> {
                     Some(n) => Some(rd_core::discovery::clean_name(&n).context("the name must be 1-40 characters")?),
                     None => None,
                 };
+                let ddns = ddns_file.as_deref().map(read_ddns_file).transpose()?;
                 service::install(service::InstallOptions {
                     data_dir,
                     port,
@@ -418,6 +484,10 @@ fn main() -> Result<()> {
                     owner,
                     pin,
                     upnp,
+                    ddns,
+                    ddns_off,
+                    wake_on_lan,
+                    app: !no_app,
                 })
             })();
             if let Some(f) = &result_file {

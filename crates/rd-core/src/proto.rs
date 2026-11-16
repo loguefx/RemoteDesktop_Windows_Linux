@@ -170,6 +170,8 @@ pub struct ClientHello {
     /// If set, the host issues a device token so future logins need no password/PIN.
     pub remember_device_as: Option<String>,
     pub mode: Mode,
+    /// This device's name, shown on the host while connected ("Laptop (windows)").
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +380,8 @@ pub enum ClientMsg {
     Files(FileRequest),
     /// Choose the video codec for this viewer.
     SetCodec(VideoCodec),
+    /// Round-trip measurement; the host answers `Pong` with the same value.
+    Ping(u64),
     Disconnect,
 }
 
@@ -394,8 +398,10 @@ pub enum HostMsg {
     Clipboard(ClipData),
     Audio(AudioChunk),
     Files(FileReply),
-    /// Usernames currently connected to this desktop.
+    /// Who is connected to this desktop ("user on device").
     Viewers(Vec<String>),
+    /// Answer to `Ping`.
+    Pong(u64),
     /// Session ended by the host.
     Bye(String),
 }
@@ -448,6 +454,8 @@ pub enum AgentCmd {
     Files { client: u32, req: FileRequest },
     /// Send Ctrl+Alt+Del as ordinary keys (non-Windows hosts).
     CtrlAltDel,
+    /// Who is connected ("user on device"); empty = nobody. Shown on the host's screen.
+    Viewers(Vec<String>),
     Stop,
 }
 
@@ -459,5 +467,7 @@ pub enum AgentEvent {
     Clipboard(ClipData),
     Audio(AudioChunk),
     Files { client: u32, reply: FileReply },
+    /// The person at the host pressed Disconnect: end every session.
+    EndSessions,
     Error(String),
 }

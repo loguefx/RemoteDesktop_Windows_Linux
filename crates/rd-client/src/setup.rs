@@ -15,6 +15,33 @@ pub struct SetupRequest {
     pub pin: String,
     /// Forward a router port (UPnP) for access from the internet.
     pub internet: bool,
+    /// Dynamic DNS to set: (name, update URL with `{ip}`).
+    pub ddns: Option<(String, String)>,
+    /// Stop using dynamic DNS.
+    pub ddns_off: bool,
+    /// Let the network adapter wake the computer (Wake-on-LAN).
+    pub wake_on_lan: bool,
+}
+
+pub const DUCKDNS_SUFFIX: &str = ".duckdns.org";
+
+/// A DuckDNS subdomain from what was typed ("home" or "home.duckdns.org").
+pub fn duckdns_subdomain(typed: &str) -> Result<String, String> {
+    let t = typed.trim().to_ascii_lowercase();
+    let sub = t.strip_suffix(DUCKDNS_SUFFIX).unwrap_or(&t).to_string();
+    if sub.is_empty() || sub.len() > 63 || !sub.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("Enter your DuckDNS name, like \"myhome\" (from myhome.duckdns.org).".into());
+    }
+    Ok(sub)
+}
+
+/// (name, update URL) for a DuckDNS subdomain and token.
+pub fn duckdns(sub: &str, token: &str) -> Result<(String, String), String> {
+    let token = token.trim();
+    if token.len() < 20 || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("That doesn't look like a DuckDNS token (copy it from duckdns.org after signing in).".into());
+    }
+    Ok((format!("{sub}{DUCKDNS_SUFFIX}"), format!("https://www.duckdns.org/update?domains={sub}&token={token}&ip={{ip}}")))
 }
 
 pub fn host_exe() -> Result<PathBuf> {
@@ -109,6 +136,18 @@ pub fn set_up(req: &SetupRequest) -> Result<()> {
     if req.internet {
         args.push("--upnp".into());
     }
+    if let Some((host, url)) = &req.ddns {
+        // The update URL holds the account token: a private file, not the command line.
+        let f = scratch.0.join("ddns");
+        std::fs::write(&f, format!("{host}\n{url}\n"))?;
+        args.push("--ddns-file".into());
+        args.push(f.display().to_string());
+    } else if req.ddns_off {
+        args.push("--ddns-off".into());
+    }
+    if req.wake_on_lan {
+        args.push("--wake-on-lan".into());
+    }
     run_elevated(&exe, &args, &result_file)
 }
 
@@ -187,11 +226,23 @@ mod tests {
 
     #[test]
     fn validation() {
-        let ok = SetupRequest { name: "Office PC".into(), pin: "4821".into(), internet: true };
-        assert!(validate(&ok).is_ok());
-        assert!(validate(&SetupRequest { pin: "123".into(), ..ok }).is_err());
-        let ok = SetupRequest { name: "Office PC".into(), pin: "4821".into(), internet: true };
-        assert!(validate(&SetupRequest { name: "a\"b".into(), ..ok }).is_err());
+        let req = || SetupRequest {
+            name: "Office PC".into(),
+            pin: "4821".into(),
+            internet: true,
+            ddns: None,
+            ddns_off: false,
+            wake_on_lan: true,
+        };
+        assert!(validate(&req()).is_ok());
+        assert!(validate(&SetupRequest { pin: "123".into(), ..req() }).is_err());
+        assert!(validate(&SetupRequest { name: "a\"b".into(), ..req() }).is_err());
+        assert_eq!(duckdns_subdomain(" MyHome.duckdns.org ").unwrap(), "myhome");
+        assert!(duckdns_subdomain("my home").is_err());
+        let (host, url) = duckdns("myhome", "a7c4d9e2-1111-2222-3333-444455556666").unwrap();
+        assert_eq!(host, "myhome.duckdns.org");
+        assert!(url.starts_with("https://www.duckdns.org/update?domains=myhome&token=a7c4") && url.ends_with("&ip={ip}"));
+        assert!(duckdns("myhome", "short").is_err());
     }
 
     #[cfg(windows)]

@@ -5,6 +5,11 @@
 //!   firewall rule for the port.
 //! * Linux: systemd unit `rd-host.service`, binary copied to `/usr/local/bin`,
 //!   data dir `/var/lib/rd-host` (0700).
+//!
+//! The app (`rd-client`, when it sits next to rd-host) is installed alongside, with a
+//! Start menu shortcut / application-menu entry. The service also uses it to show the
+//! "your screen is being shared" notice. Turning remote access off keeps the app;
+//! `uninstall --purge` removes it too.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +42,19 @@ pub struct InstallOptions {
     pub owner: Option<String>,
     pub pin: Option<String>,
     pub upnp: bool,
+    /// Dynamic DNS (name, update URL) to save; `ddns_off` removes it.
+    pub ddns: Option<(String, String)>,
+    pub ddns_off: bool,
+    /// Let the network adapter wake the computer (Wake-on-LAN).
+    pub wake_on_lan: bool,
+    /// Install the app next to the service, with a menu entry.
+    pub app: bool,
+}
+
+/// rd-client next to this program, if it's there.
+fn app_beside_me() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.with_file_name(if cfg!(windows) { "rd-client.exe" } else { "rd-client" });
+    exe.exists().then_some(exe)
 }
 
 /// Save settings, create the first admin if needed, generate the TLS cert.
@@ -59,6 +77,7 @@ fn prepare_data(opts: &InstallOptions) -> Result<String> {
         db.set_setting("name", name)?;
     }
     db.set_setting("upnp", if opts.upnp { "on" } else { "off" })?;
+    crate::save_ddns(&db, opts.ddns.as_ref(), opts.ddns_off)?;
     if let Some(owner) = &opts.owner {
         let pin = opts.pin.as_deref().context("a PIN is required")?;
         set_owner(&mut db, owner, pin)?;
@@ -214,6 +233,10 @@ mod win {
             std::fs::copy(&me, &exe).with_context(|| format!("copy binary to {}", exe.display()))?;
         }
 
+        if opts.app {
+            install_app(&dir);
+        }
+
         let fp = prepare_data(&opts)?;
 
         let info = ServiceInfo {
@@ -289,9 +312,57 @@ mod win {
             println!("warning: could not enable SoftwareSASGeneration; Ctrl+Alt+Del from viewers won't work");
         }
 
+        if opts.wake_on_lan {
+            // Every adapter that supports it: wake on a magic packet only.
+            let ok = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetAdapter -Physical | Set-NetAdapterPowerManagement -WakeOnMagicPacket Enabled -ErrorAction SilentlyContinue",
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            println!("{}", if ok { "Wake-on-LAN enabled on the network adapters." } else { "note: couldn't enable Wake-on-LAN on the network adapters" });
+        }
+
         svc.start::<&str>(&[]).context("start service")?;
         print_summary(&opts, &fp);
         Ok(())
+    }
+
+    fn start_menu_link() -> PathBuf {
+        let base = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        base.join(r"Microsoft\Windows\Start Menu\Programs\RD Remote Desktop.lnk")
+    }
+
+    /// Copy the app next to the service and add a Start menu shortcut. Failures only
+    /// warn: the service works without it (e.g. the app is open and can't be replaced).
+    fn install_app(dir: &Path) {
+        let Some(src) = app_beside_me() else { return };
+        let dst = dir.join("rd-client.exe");
+        if !same_file(&src, &dst) {
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                println!("note: couldn't copy the app to {} ({e}); close it there and set up again to update it", dst.display());
+                if !dst.exists() {
+                    return;
+                }
+            }
+        }
+        let ps = format!(
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath = '{}'; $s.WorkingDirectory = '{}'; $s.Description = 'Connect to your computers'; $s.Save()",
+            start_menu_link().display().to_string().replace('\'', "''"),
+            dst.display().to_string().replace('\'', "''"),
+            dir.display().to_string().replace('\'', "''"),
+        );
+        let ok = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if ok {
+            println!("Added \"RD Remote Desktop\" to the Start menu.");
+        }
     }
 
     pub fn uninstall(data_dir: &Path, purge: bool) -> Result<()> {
@@ -306,10 +377,15 @@ mod win {
             let _ = Command::new("netsh").args(["advfirewall", "firewall", "delete", "rule", rule]).output();
         }
         let exe = install_dir().join("rd-host.exe");
-        if !same_file(&std::env::current_exe()?, &exe) {
+        if same_file(&std::env::current_exe()?, &exe) {
+            println!("Note: delete {} manually after this process exits.", exe.display());
+        } else if purge {
+            // Everything, including the app and its shortcut.
+            let _ = std::fs::remove_file(start_menu_link());
             let _ = std::fs::remove_dir_all(install_dir());
         } else {
-            println!("Note: delete {} manually after this process exits.", install_dir().display());
+            // Keep the app: it's also how you connect to your other computers.
+            let _ = std::fs::remove_file(&exe);
         }
         if purge {
             std::fs::remove_dir_all(data_dir).ok();
@@ -421,6 +497,9 @@ mod linux {
             std::fs::copy(&me, &tmp).with_context(|| format!("copy binary to {BIN}"))?;
             std::fs::rename(&tmp, BIN)?;
         }
+        if opts.app {
+            install_app();
+        }
         let fp = prepare_data(&opts)?;
         let unit = format!(
             "[Unit]\n\
@@ -443,10 +522,67 @@ mod linux {
         if opts.firewall {
             open_firewall(opts.port);
         }
+        if opts.wake_on_lan {
+            enable_wake_on_lan();
+        }
         println!();
         println!("Wayland note: the first remote session shows a screen-sharing prompt on this");
         println!("computer's screen; approve it once locally and later sessions start unattended.");
         Ok(())
+    }
+
+    const APP: &str = "/usr/local/bin/rd-client";
+    const DESKTOP_FILE: &str = "/usr/share/applications/rd-remote-desktop.desktop";
+
+    /// Copy the app to /usr/local/bin and add it to the application menu.
+    fn install_app() {
+        let Some(src) = app_beside_me() else { return };
+        if src != Path::new(APP) {
+            let tmp = format!("{APP}.new");
+            if let Err(e) = std::fs::copy(&src, &tmp).and_then(|_| std::fs::rename(&tmp, APP)) {
+                println!("note: couldn't install the app to {APP}: {e}");
+                return;
+            }
+        }
+        let entry = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=RD Remote Desktop\n\
+             Comment=Connect to your computers\n\
+             Exec={APP}\n\
+             Icon=preferences-desktop-remote-desktop\n\
+             Terminal=false\n\
+             Categories=Network;RemoteAccess;\n"
+        );
+        // Leave a menu entry that a package installed alone.
+        let ours = std::fs::read_to_string(DESKTOP_FILE).map(|t| t.contains(APP)).unwrap_or(true);
+        if ours && std::fs::write(DESKTOP_FILE, entry).is_ok() {
+            println!("Added \"RD Remote Desktop\" to the application menu.");
+        }
+    }
+
+    /// Wake-on-LAN for wired connections managed by NetworkManager (kept across reboots).
+    fn enable_wake_on_lan() {
+        let Ok(out) = Command::new("nmcli").args(["-t", "-f", "NAME,TYPE", "connection", "show"]).output() else {
+            println!("note: NetworkManager not found; enable Wake-on-LAN with ethtool (wol g) if you want it");
+            return;
+        };
+        let mut done = 0;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // NAME may contain escaped colons; TYPE is the last field.
+            let Some((name, kind)) = line.rsplit_once(':') else { continue };
+            if kind == "802-3-ethernet" {
+                let name = name.replace("\\:", ":");
+                if quiet("nmcli", &["connection", "modify", &name, "802-3-ethernet.wake-on-lan", "magic"]) {
+                    done += 1;
+                }
+            }
+        }
+        if done > 0 {
+            println!("Wake-on-LAN enabled for {done} wired connection(s); it takes effect the next time they connect.");
+        } else {
+            println!("note: no wired connection found for Wake-on-LAN (it needs an Ethernet cable)");
+        }
     }
 
     fn ufw_active() -> bool {
@@ -512,6 +648,10 @@ mod linux {
         let _ = std::fs::remove_file(BIN);
         println!("Removed service and {BIN}.");
         if purge {
+            if std::fs::read_to_string(DESKTOP_FILE).is_ok_and(|t| t.contains(APP)) {
+                let _ = std::fs::remove_file(DESKTOP_FILE);
+            }
+            let _ = std::fs::remove_file(APP);
             std::fs::remove_dir_all(data_dir).ok();
             println!("Deleted {} (users, devices, certificate).", data_dir.display());
         } else {
