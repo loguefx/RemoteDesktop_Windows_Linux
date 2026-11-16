@@ -19,6 +19,10 @@ pub const QUERY_MAGIC: &[u8; 4] = b"RDQ1";
 pub const REPLY_MAGIC: &[u8; 4] = b"RDA1";
 /// Query size, and the largest reply.
 pub const QUERY_LEN: usize = 600;
+/// UDP port the app asks from, so answers arrive on a known port. Linux firewalls (ufw,
+/// firewalld) drop a unicast answer to a broadcast on a random port, so the host
+/// installer opens this one. The app falls back to any free port if it's taken.
+pub const REPLY_PORT: u16 = 47802;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announce {

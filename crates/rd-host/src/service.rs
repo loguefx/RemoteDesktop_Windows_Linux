@@ -600,34 +600,40 @@ mod linux {
         Command::new(cmd).args(args).output().is_ok_and(|o| o.status.success())
     }
 
-    /// Open the session port (TCP) and discovery (UDP) in ufw or firewalld, if active.
+    /// Open the session port (TCP), discovery (UDP) and the app's discovery-answer port
+    /// (UDP) in ufw or firewalld, if active.
     fn open_firewall(port: u16) {
         let (tcp, udp) = (format!("{port}/tcp"), format!("{port}/udp"));
+        let reply = format!("{}/udp", rd_core::discovery::REPLY_PORT);
         let opened = if ufw_active() {
-            Some(("ufw", quiet("ufw", &["allow", &tcp]) && quiet("ufw", &["allow", &udp])))
+            Some(("ufw", quiet("ufw", &["allow", &tcp]) && quiet("ufw", &["allow", &udp]) && quiet("ufw", &["allow", &reply])))
         } else if firewalld_running() {
             let ok = quiet("firewall-cmd", &["--permanent", &format!("--add-port={tcp}")])
                 && quiet("firewall-cmd", &["--permanent", &format!("--add-port={udp}")])
+                && quiet("firewall-cmd", &["--permanent", &format!("--add-port={reply}")])
                 && quiet("firewall-cmd", &["--reload"]);
             Some(("firewalld", ok))
         } else {
             None
         };
         match opened {
-            Some((fw, true)) => println!("Opened {tcp} and {udp} in {fw}."),
-            Some((fw, false)) => println!("warning: could not open {tcp} and {udp} in {fw}"),
+            Some((fw, true)) => println!("Opened {tcp}, {udp} and {reply} in {fw}."),
+            Some((fw, false)) => println!("warning: could not open {tcp}, {udp} and {reply} in {fw}"),
             None => {}
         }
     }
 
     fn close_firewall(port: u16) {
         let (tcp, udp) = (format!("{port}/tcp"), format!("{port}/udp"));
+        let reply = format!("{}/udp", rd_core::discovery::REPLY_PORT);
         if ufw_active() {
             quiet("ufw", &["delete", "allow", &tcp]);
             quiet("ufw", &["delete", "allow", &udp]);
+            quiet("ufw", &["delete", "allow", &reply]);
         } else if firewalld_running() {
             quiet("firewall-cmd", &["--permanent", &format!("--remove-port={tcp}")]);
             quiet("firewall-cmd", &["--permanent", &format!("--remove-port={udp}")]);
+            quiet("firewall-cmd", &["--permanent", &format!("--remove-port={reply}")]);
             quiet("firewall-cmd", &["--reload"]);
         }
     }

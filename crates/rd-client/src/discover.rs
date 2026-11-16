@@ -128,7 +128,10 @@ pub fn wake(macs: &[[u8; 6]], lan: Option<SocketAddr>) -> std::io::Result<usize>
 fn bind() -> std::io::Result<UdpSocket> {
     let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     s.set_broadcast(true)?;
-    s.bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())?;
+    // The known reply port (opened in Linux firewalls by the installer), else any port.
+    if s.bind(&SocketAddr::from(([0, 0, 0, 0], discovery::REPLY_PORT)).into()).is_err() {
+        s.bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())?;
+    }
     s.set_nonblocking(true)?;
     UdpSocket::from_std(s.into())
 }

@@ -113,7 +113,10 @@ For host audio on Linux, install `pulseaudio-utils` (it provides `parec`; works 
   local and incoming traffic outside the VPN (split tunnelling), or use a relay.
 
 **How computers are found:** the app broadcasts a small UDP query on port 47800 on each local
-network, and hosts answer with their name, certificate fingerprint and internet address. The app
+network (from UDP port 47802), and hosts answer with their name, certificate fingerprint and
+internet address. On Linux the installer opens 47800/udp and 47802/udp in ufw or firewalld; on a
+Linux computer that only runs the app, open the answer port yourself
+(`sudo ufw allow 47802/udp`) or other computers won't show up there. The app
 pins that fingerprint, so later connections (from anywhere) only accept the same computer. The
 very first contact trusts whatever answers on your network, like pairing a Bluetooth device;
 the PIN is still needed to get in.
