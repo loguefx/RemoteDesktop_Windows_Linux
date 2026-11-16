@@ -217,15 +217,15 @@ struct StreamData {
 
 fn pipewire_main(fd: OwnedFd, node: u32, shared: Arc<Shared>, quit: pw::channel::Receiver<()>) -> Result<()> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoop::new(None)?;
-    let context = pw::context::Context::new(&mainloop)?;
-    let core = context.connect_fd(fd, None)?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let core = context.connect_fd_rc(fd, None)?;
 
     let ml = mainloop.clone();
     let _quit = quit.attach(mainloop.loop_(), move |()| ml.quit());
 
-    let stream = pw::stream::Stream::new(
-        &core,
+    let stream = pw::stream::StreamRc::new(
+        core,
         "rd-host-capture",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",

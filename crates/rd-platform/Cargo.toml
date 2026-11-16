@@ -33,6 +33,6 @@ windows = { version = "0.58", features = [
 x11rb = { version = "0.13", features = ["shm", "xtest", "randr", "allow-unsafe-code"] }
 libc = "0.2"
 ashpd = { version = "0.11", optional = true, default-features = false, features = ["tokio"] }
-pipewire = { version = "0.8", optional = true }
+pipewire = { version = "0.9", optional = true }
 tokio = { workspace = true, optional = true }
 
