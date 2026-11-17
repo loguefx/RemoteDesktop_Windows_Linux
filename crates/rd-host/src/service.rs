@@ -60,7 +60,13 @@ pub struct InstallOptions {
 /// Replace the installed service (and app) with this program's version, keeping all
 /// settings, accounts and the certificate (the app's "Update" button runs this).
 pub fn update(data_dir: PathBuf, app: bool) -> Result<()> {
-    let db = Db::open(&data_dir)?;
+    let db = Db::open(&data_dir).with_context(|| {
+        if cfg!(windows) {
+            "can't read the settings; run this from an Administrator terminal".to_string()
+        } else {
+            "can't read the settings; run this with sudo".to_string()
+        }
+    })?;
     if db.user_count()? == 0 {
         anyhow::bail!("remote access isn't set up on this computer yet");
     }
