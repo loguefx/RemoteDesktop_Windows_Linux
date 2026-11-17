@@ -93,10 +93,10 @@ pub fn validate(req: &SetupRequest) -> Result<(), String> {
 }
 
 /// A private scratch folder for the PIN and result files.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let dir = std::env::temp_dir().join(format!("rd-setup-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -182,7 +182,7 @@ fn read_result(result_file: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn run_elevated(exe: &Path, args: &[String], result_file: &Path) -> Result<()> {
+pub(crate) fn run_elevated(exe: &Path, args: &[String], result_file: &Path) -> Result<()> {
     use anyhow::Context;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -204,7 +204,7 @@ fn run_elevated(exe: &Path, args: &[String], result_file: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn run_elevated(exe: &Path, args: &[String], result_file: &Path) -> Result<()> {
+pub(crate) fn run_elevated(exe: &Path, args: &[String], result_file: &Path) -> Result<()> {
     let out = match Command::new("pkexec").arg(exe).args(args).output() {
         Ok(o) => o,
         Err(_) => bail!("pkexec isn't available; run `sudo {} {}` in a terminal instead", exe.display(), args.join(" ")),

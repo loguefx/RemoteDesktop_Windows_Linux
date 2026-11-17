@@ -132,11 +132,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RelayCmd,
     },
+    /// Install the app and this program and add the app to the Start menu / application
+    /// menu, without turning on remote access (the installer runs this). If the service is
+    /// installed, it's updated too, keeping every setting.
+    #[command(name = "install-app")]
+    InstallApp {
+        /// Write "ok" or "error: ..." here when done.
+        #[arg(long)]
+        result_file: Option<PathBuf>,
+    },
     /// Stop and remove the service.
     Uninstall {
-        /// Also delete the user database and host key.
+        /// Also delete the user database and host key (and the app).
         #[arg(long)]
         purge: bool,
+        /// Also remove the app, its menu entry and this program.
+        #[arg(long)]
+        app: bool,
         /// Write "ok" or "error: ..." here when done (used by the app).
         #[arg(long)]
         result_file: Option<PathBuf>,
@@ -566,8 +578,19 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Uninstall { purge, result_file } => {
-            let r = service::uninstall(&data_dir, purge);
+        Cmd::InstallApp { result_file } => {
+            init_logging(None);
+            let r = service::install_programs(data_dir);
+            if let Some(f) = &result_file {
+                let _ = std::fs::write(f, match &r {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("error: {e:#}"),
+                });
+            }
+            r
+        }
+        Cmd::Uninstall { purge, app, result_file } => {
+            let r = service::uninstall(&data_dir, purge, app || purge);
             if let Some(f) = &result_file {
                 let _ = std::fs::write(f, match &r {
                     Ok(()) => "ok".to_string(),

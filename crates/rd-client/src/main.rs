@@ -6,6 +6,7 @@
 //! rd-client connect 482-913-077@relay.example.com      ... through a relay
 //! rd-client find                      list computers on this network
 //! rd-client setup [--name N]          turn on remote access for this computer (like the app)
+//! rd-client uninstall                  remove the app (and remote access) from this computer
 //! rd-client saved                      list hosts you have trusted / saved sign-ins for
 //! rd-client forget myhost [--keep-trust]
 //! rd-client account myhost passwd|set-pin|devices|revoke <id>|whoami
@@ -19,6 +20,7 @@ mod config;
 mod discover;
 mod conn;
 mod gui;
+mod installer;
 mod keyhook;
 mod keymap;
 mod notice;
@@ -110,6 +112,17 @@ enum Cmd {
         /// Turn remote access off instead.
         #[arg(long, conflicts_with_all = ["name", "no_internet"])]
         off: bool,
+    },
+    /// Remove the app and remote access from this computer (opens a window).
+    Uninstall,
+    /// (packaging) Make the one-file installer: this program with rd-host inside.
+    #[command(hide = true, name = "make-installer")]
+    MakeInstaller {
+        /// The rd-host program to put inside.
+        #[arg(long)]
+        host: std::path::PathBuf,
+        /// The installer to write.
+        out: std::path::PathBuf,
     },
     /// Open the app connected to a host (sign-in happens in the window).
     Connect {
@@ -299,10 +312,21 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     let Some(cmd) = cli.cmd else {
+        // The one-file installer is this program with rd-host attached.
+        if let Some(payload) = installer::embedded() {
+            return gui::run_installer(rt, installer::Installer::install(payload));
+        }
         return gui::run(rt, None);
     };
     match cmd {
         Cmd::Connect { host } => gui::run(rt, Some(host)),
+        Cmd::Uninstall => {
+            if installer::relaunch_outside_install_dir()? {
+                return Ok(());
+            }
+            gui::run_installer(rt, installer::Installer::uninstall())
+        }
+        Cmd::MakeInstaller { host, out } => installer::make(&host, &out),
         Cmd::Notice { connect } => gui::run_notice(rt, &connect),
         Cmd::Setup { name, no_internet, ask_to_allow, off } => {
             if off {

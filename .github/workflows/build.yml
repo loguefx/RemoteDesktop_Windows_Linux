@@ -35,10 +35,16 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/rd-client.exe, target/release/rd-host.exe, target/release/rd-relay.exe, README.md $dir
           Compress-Archive -Path "$dir/*" -DestinationPath "dist/rd-remote-desktop-windows-x64.zip" -Force
+          # The one-file installer (rd-client is a windowed program: wait for it).
+          $setup = "dist/RD-Remote-Desktop-Setup-windows-x64.exe"
+          Start-Process -Wait -NoNewWindow -FilePath target/release/rd-client.exe -ArgumentList "make-installer", "--host", "target/release/rd-host.exe", $setup
+          if (-not (Test-Path $setup)) { throw "installer not made" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: dist/rd-remote-desktop-windows-x64.zip
+          path: |
+            dist/rd-remote-desktop-windows-x64.zip
+            dist/RD-Remote-Desktop-Setup-windows-x64.exe
 
   linux:
     runs-on: ubuntu-24.04
@@ -61,10 +67,16 @@ jobs:
           mkdir -p "$dir"
           cp target/release/rd-client target/release/rd-host target/release/rd-relay README.md "$dir/"
           tar -C dist -czf dist/rd-remote-desktop-linux-x86_64.tar.gz rd-remote-desktop-linux-x86_64
+          # The one-file installer, in a .tar.gz so it stays executable (double-click after extracting).
+          mkdir -p dist/setup
+          target/release/rd-client make-installer --host target/release/rd-host dist/setup/RD-Remote-Desktop-Setup
+          tar -C dist/setup -czf dist/RD-Remote-Desktop-Setup-linux-x86_64.tar.gz RD-Remote-Desktop-Setup
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: dist/rd-remote-desktop-linux-x86_64.tar.gz
+          path: |
+            dist/rd-remote-desktop-linux-x86_64.tar.gz
+            dist/RD-Remote-Desktop-Setup-linux-x86_64.tar.gz
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -84,4 +96,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
-            --notes "Windows: unzip and run rd-client.exe. Linux: extract and run ./rd-client (keep rd-host next to it). Then choose Set up remote access."
+            --notes "Windows: run RD-Remote-Desktop-Setup-windows-x64.exe. Linux: extract RD-Remote-Desktop-Setup-linux-x86_64.tar.gz and double-click RD-Remote-Desktop-Setup. Then open RD Remote Desktop from the Start menu / application menu and choose Set up remote access. (The .zip / .tar.gz with the plain programs are for the app's Update button and for scripting.)"

@@ -101,6 +101,18 @@ pub fn update(data_dir: PathBuf, app: bool) -> Result<()> {
     install(opts)
 }
 
+/// Install the programs and the app's menu entry. With the service installed, this is an
+/// update of everything (settings kept); without it, remote access stays off.
+pub fn install_programs(data_dir: PathBuf) -> Result<()> {
+    if service_installed() {
+        return update(data_dir, true);
+    }
+    copy_programs()
+}
+
+/// The name the installer registers.
+pub const APP_NAME: &str = "RD Remote Desktop";
+
 /// rd-client next to this program, if it's there.
 fn app_beside_me() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.with_file_name(if cfg!(windows) { "rd-client.exe" } else { "rd-client" });
@@ -392,6 +404,71 @@ mod win {
         Ok(())
     }
 
+    pub fn service_installed() -> bool {
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .and_then(|m| m.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS))
+            .is_ok()
+    }
+
+    /// rd-host and the app in Program Files, without the service.
+    pub(super) fn copy_programs() -> Result<()> {
+        let dir = install_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create {} - run this from an Administrator terminal", dir.display()))?;
+        let exe = dir.join("rd-host.exe");
+        let me = std::env::current_exe()?;
+        if !same_file(&me, &exe) {
+            let _ = std::fs::remove_file(dir.join("rd-host.old.exe"));
+            if std::fs::copy(&me, &exe).is_err() && exe.exists() {
+                // In use: move it out of the way.
+                let _ = std::fs::rename(&exe, dir.join("rd-host.old.exe"));
+            }
+            std::fs::copy(&me, &exe).with_context(|| format!("copy rd-host to {}", exe.display()))?;
+        }
+        if app_beside_me().is_none() {
+            anyhow::bail!("rd-client.exe wasn't found next to rd-host.exe");
+        }
+        install_app(&dir);
+        if !dir.join("rd-client.exe").exists() {
+            anyhow::bail!("couldn't copy the app to {}", dir.display());
+        }
+        println!("Installed {APP_NAME} in {}.", dir.display());
+        Ok(())
+    }
+
+    const UNINSTALL_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RDRemoteDesktop";
+
+    /// The entry in Settings > Apps > Installed apps, which runs `rd-client uninstall`.
+    fn register_uninstall(dir: &Path) {
+        let app = dir.join("rd-client.exe");
+        let size_kb = ["rd-client.exe", "rd-host.exe"]
+            .iter()
+            .filter_map(|f| std::fs::metadata(dir.join(f)).ok())
+            .map(|m| m.len() / 1024)
+            .sum::<u64>();
+        let values: [(&str, &str, String); 9] = [
+            ("DisplayName", "REG_SZ", APP_NAME.to_string()),
+            ("DisplayVersion", "REG_SZ", env!("CARGO_PKG_VERSION").to_string()),
+            ("Publisher", "REG_SZ", APP_NAME.to_string()),
+            ("DisplayIcon", "REG_SZ", app.display().to_string()),
+            ("InstallLocation", "REG_SZ", dir.display().to_string()),
+            ("UninstallString", "REG_SZ", format!("\"{}\" uninstall", app.display())),
+            ("NoModify", "REG_DWORD", "1".into()),
+            ("NoRepair", "REG_DWORD", "1".into()),
+            ("EstimatedSize", "REG_DWORD", size_kb.to_string()),
+        ];
+        let mut ok = true;
+        for (name, kind, data) in values {
+            ok &= Command::new("reg")
+                .args(["add", UNINSTALL_KEY, "/v", name, "/t", kind, "/d", &data, "/f"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+        }
+        if !ok {
+            println!("note: couldn't add {APP_NAME} to Installed apps");
+        }
+    }
+
     fn start_menu_link() -> PathBuf {
         let base = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         base.join(r"Microsoft\Windows\Start Menu\Programs\RD Remote Desktop.lnk")
@@ -429,9 +506,10 @@ mod win {
         if ok {
             println!("Added \"RD Remote Desktop\" to the Start menu.");
         }
+        register_uninstall(dir);
     }
 
-    pub fn uninstall(data_dir: &Path, purge: bool) -> Result<()> {
+    pub fn uninstall(data_dir: &Path, purge: bool, app: bool) -> Result<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .context("cannot open the Service Control Manager - run this from an elevated terminal")?;
         if stop_and_delete_existing(&manager)? {
@@ -442,15 +520,22 @@ mod win {
         for rule in ["name=RD Remote Desktop Host", "name=RD Remote Desktop Host (P2P)"] {
             let _ = Command::new("netsh").args(["advfirewall", "firewall", "delete", "rule", rule]).output();
         }
-        let exe = install_dir().join("rd-host.exe");
-        if same_file(&std::env::current_exe()?, &exe) {
-            println!("Note: delete {} manually after this process exits.", exe.display());
-        } else if purge {
-            // Everything, including the app and its shortcut.
+        let dir = install_dir();
+        let exe = dir.join("rd-host.exe");
+        let mut left = None;
+        if app {
+            // Everything: the app, its shortcut, the Installed apps entry.
             let _ = std::fs::remove_file(start_menu_link());
-            let _ = std::fs::remove_dir_all(install_dir());
-        } else {
-            // Keep the app: it's also how you connect to your other computers.
+            let _ = Command::new("reg").args(["delete", UNINSTALL_KEY, "/f"]).output();
+            if same_file(&std::env::current_exe()?, &exe) {
+                left = Some(format!("delete {} after this program exits", dir.display()));
+            } else if dir.exists() && std::fs::remove_dir_all(&dir).is_err() && dir.exists() {
+                left = Some(format!("{} couldn't be deleted completely; close RD Remote Desktop and delete it", dir.display()));
+            } else {
+                println!("Removed {APP_NAME} from {}.", dir.display());
+            }
+        } else if !dir.join("rd-client.exe").exists() && !same_file(&std::env::current_exe()?, &exe) {
+            // Kept while the app is installed: it sets remote access up again.
             let _ = std::fs::remove_file(&exe);
         }
         if purge {
@@ -458,6 +543,9 @@ mod win {
             println!("Deleted {} (users, devices, certificate).", data_dir.display());
         } else {
             println!("Kept {} (use --purge to delete users and keys).", data_dir.display());
+        }
+        if let Some(note) = left {
+            anyhow::bail!("{note}");
         }
         Ok(())
     }
@@ -600,6 +688,32 @@ mod linux {
     const APP: &str = "/usr/local/bin/rd-client";
     const DESKTOP_FILE: &str = "/usr/share/applications/rd-remote-desktop.desktop";
 
+    pub fn service_installed() -> bool {
+        Path::new(UNIT).exists()
+    }
+
+    /// rd-host and the app in /usr/local/bin, without the service.
+    pub(super) fn copy_programs() -> Result<()> {
+        if !crate::paths::is_root() {
+            bail!("run this as root (sudo)");
+        }
+        let me = std::env::current_exe()?;
+        if me != Path::new(BIN) {
+            let tmp = format!("{BIN}.new");
+            std::fs::copy(&me, &tmp).with_context(|| format!("copy rd-host to {BIN}"))?;
+            std::fs::rename(&tmp, BIN)?;
+        }
+        if app_beside_me().is_none() {
+            bail!("rd-client wasn't found next to rd-host");
+        }
+        install_app();
+        if !Path::new(APP).exists() {
+            bail!("couldn't install the app to {APP}");
+        }
+        println!("Installed {APP_NAME} in /usr/local/bin.");
+        Ok(())
+    }
+
     /// Copy the app to /usr/local/bin and add it to the application menu.
     fn install_app() {
         let Some(src) = app_beside_me() else { return };
@@ -618,7 +732,11 @@ mod linux {
              Exec={APP}\n\
              Icon=preferences-desktop-remote-desktop\n\
              Terminal=false\n\
-             Categories=Network;RemoteAccess;\n"
+             Categories=Network;RemoteAccess;\n\
+             Actions=uninstall;\n\n\
+             [Desktop Action uninstall]\n\
+             Name=Uninstall\n\
+             Exec={APP} uninstall\n"
         );
         // Leave a menu entry that a package installed alone.
         let ours = std::fs::read_to_string(DESKTOP_FILE).map(|t| t.contains(APP)).unwrap_or(true);
@@ -704,7 +822,7 @@ mod linux {
         }
     }
 
-    pub fn uninstall(data_dir: &Path, purge: bool) -> Result<()> {
+    pub fn uninstall(data_dir: &Path, purge: bool, app: bool) -> Result<()> {
         if !crate::paths::is_root() {
             bail!("run as root (sudo rd-host uninstall)");
         }
@@ -717,13 +835,19 @@ mod linux {
         let _ = Command::new("systemctl").args(["disable", "--now", SERVICE_NAME]).status();
         let _ = std::fs::remove_file(UNIT);
         let _ = Command::new("systemctl").args(["daemon-reload"]).status();
-        let _ = std::fs::remove_file(BIN);
-        println!("Removed service and {BIN}.");
-        if purge {
+        println!("Removed the service.");
+        // rd-host stays while the app is installed: it sets remote access up again.
+        if app || !Path::new(APP).exists() {
+            let _ = std::fs::remove_file(BIN);
+        }
+        if app {
             if std::fs::read_to_string(DESKTOP_FILE).is_ok_and(|t| t.contains(APP)) {
                 let _ = std::fs::remove_file(DESKTOP_FILE);
             }
             let _ = std::fs::remove_file(APP);
+            println!("Removed {APP_NAME} from /usr/local/bin.");
+        }
+        if purge {
             std::fs::remove_dir_all(data_dir).ok();
             println!("Deleted {} (users, devices, certificate).", data_dir.display());
         } else {

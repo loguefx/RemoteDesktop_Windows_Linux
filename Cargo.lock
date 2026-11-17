@@ -3204,6 +3204,7 @@ dependencies = [
  "glutin-winit",
  "if-addrs",
  "log",
+ "lz4_flex",
  "qrcode",
  "rd-core",
  "rfd",

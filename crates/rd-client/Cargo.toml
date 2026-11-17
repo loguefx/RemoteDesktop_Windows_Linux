@@ -37,6 +37,8 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 gilrs = { version = "0.11", optional = true }
 # QR code for setting up two-step sign-in in an authenticator app.
 qrcode = { version = "0.14", default-features = false }
+# The one-file installer carries rd-host compressed.
+lz4_flex = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 # Low-level keyboard hook: system shortcuts (Windows key, Alt+Tab) for the remote computer.

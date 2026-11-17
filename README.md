@@ -44,10 +44,38 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
 
 ## Download or build
 
-**Ready-made downloads:** each version tag (`v0.2.0`, ...) builds Windows and Linux packages on
-GitHub Actions and publishes them under **Releases**. Unzip and run `rd-client`, with `rd-host` next
-to it. The app checks GitHub for a newer release when it starts and shows a *Download* link; set
-`RD_NO_UPDATE_CHECK=1` to turn that off.
+**Installers:** each version tag (`v0.2.0`, ...) builds the installers on GitHub Actions and
+publishes them under **Releases**:
+
+- **Windows:** download `RD-Remote-Desktop-Setup-windows-x64.exe` and double-click it. Windows
+  SmartScreen may say it doesn't recognise the app (it isn't code-signed): *More info*, *Run anyway*.
+- **Linux:** download `RD-Remote-Desktop-Setup-linux-x86_64.tar.gz`, extract it, and double-click
+  `RD-Remote-Desktop-Setup` (KDE asks whether to run it; on GNOME, right-click it and choose
+  *Run as a Program*). Or from a terminal: `./RD-Remote-Desktop-Setup`.
+
+Choose **Install** and approve the administrator prompt (UAC on Windows, your password on Linux).
+It installs the app for everyone:
+
+| | Windows | Linux |
+|---|---|---|
+| Programs | `C:\Program Files\RDHost` | `/usr/local/bin` |
+| Menu | Start menu: *RD Remote Desktop* | application menu: *RD Remote Desktop* |
+| Desktop shortcut | optional, ticked by default | optional, ticked by default |
+| Uninstall | Settings > Apps > Installed apps | right-click the menu entry > *Uninstall* |
+
+Remote access stays off until you choose **Set up remote access** in the app. Running a newer
+installer over an installed version updates it, keeping every setting, account and saved
+computer (and the service, if remote access is on). `rd-client uninstall` opens the uninstaller
+too; it turns remote access off and removes the app, and can also delete the accounts, PINs and
+certificate.
+
+The app checks GitHub for a newer release when it starts and offers *Update now*; set
+`RD_NO_UPDATE_CHECK=1` to turn that off. The release also has the plain programs (`.zip` /
+`.tar.gz`) for scripting.
+
+**Making the installer yourself** after building: `rd-client make-installer --host
+target/release/rd-host RD-Remote-Desktop-Setup` (add `.exe` on Windows). It's the app with
+rd-host packed inside, so it's one file.
 
 **Arch / CachyOS / Manjaro:** `cd packaging/arch && makepkg -si` builds and installs a package from
 the latest source, with an application-menu entry.
@@ -84,7 +112,8 @@ For host audio on Linux, install `pulseaudio-utils` (it provides `parec`; works 
 
 ## Quick start (the app)
 
-1. Put `rd-client` and `rd-host` in the same folder on each computer and open `rd-client`.
+1. Install the app on each computer (see above), or put `rd-client` and `rd-host` in the same
+   folder and open `rd-client`.
 2. On a computer you want to reach, choose **Set up remote access** under **This computer**:
    - **Name:** how it appears in your other devices' list.
    - **PIN:** at least 4 digits. You'll type it when you connect from another device.

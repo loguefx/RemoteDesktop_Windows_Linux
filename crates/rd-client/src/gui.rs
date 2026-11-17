@@ -2418,11 +2418,13 @@ enum UserEvent {
 enum Start {
     Main(Option<String>),
     Notice(crate::notice::Notice),
+    Installer(crate::installer::Installer),
 }
 
 enum Content {
     Main(Gui),
     Notice(crate::notice::Notice),
+    Installer(crate::installer::Installer),
 }
 
 impl Content {
@@ -2430,6 +2432,7 @@ impl Content {
         match self {
             Content::Main(g) => g.ui(ctx),
             Content::Notice(n) => n.ui(ctx),
+            Content::Installer(i) => i.ui(ctx),
         }
     }
 
@@ -2437,6 +2440,7 @@ impl Content {
         match self {
             Content::Main(g) => g.window_title(),
             Content::Notice(n) => n.title(),
+            Content::Installer(i) => i.title(),
         }
     }
 }
@@ -2598,6 +2602,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 }
                 Content::Notice(n)
             }
+            Some(Start::Installer(i)) => Content::Installer(i),
             Some(Start::Main(autoconnect)) => Content::Main(Gui::new(self.rt.clone(), eg.egui_ctx.clone(), autoconnect)),
             None => Content::Main(Gui::new(self.rt.clone(), eg.egui_ctx.clone(), None)),
         });
@@ -2723,6 +2728,16 @@ pub fn run_notice(rt: tokio::runtime::Runtime, connect: &str) -> Result<()> {
         .with_enabled_buttons(winit::window::WindowButtons::MINIMIZE)
         .with_visible(false);
     run_window(rt, attrs, Start::Notice(notice))
+}
+
+/// The installer or uninstaller window.
+pub fn run_installer(rt: tokio::runtime::Runtime, installer: crate::installer::Installer) -> Result<()> {
+    let attrs = winit::window::WindowAttributes::default()
+        .with_resizable(true)
+        .with_inner_size(winit::dpi::LogicalSize { width: 540.0, height: 340.0 })
+        .with_title(installer.title())
+        .with_visible(false);
+    run_window(rt, attrs, Start::Installer(installer))
 }
 
 fn run_window(rt: tokio::runtime::Runtime, attrs: winit::window::WindowAttributes, start: Start) -> Result<()> {

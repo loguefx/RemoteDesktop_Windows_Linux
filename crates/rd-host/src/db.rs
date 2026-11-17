@@ -587,6 +587,7 @@ mod tests {
         assert!(db.set_role("alice", Role::User).is_err());
         db.set_role("bob", Role::Admin).unwrap();
         db.set_role("alice", Role::User).unwrap();
+        drop(db); // Windows can't delete an open database file
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -601,6 +602,7 @@ mod tests {
         assert!(matches!(r, Err(AuthError::Locked(_))), "correct password rejected while locked");
         db.unlock("carol").unwrap();
         assert!(db.authenticate("carol", &Credential::Password("password123".into()), None).unwrap().is_ok());
+        drop(db); // Windows can't delete an open database file
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -647,6 +649,7 @@ mod tests {
         assert!(db.authenticate("owner", &Credential::DeviceToken(tok.clone()), None).unwrap().is_ok(), "remembered devices skip the code");
         db.totp_disable("owner").unwrap();
         assert!(db.authenticate("owner", &Credential::Pin("4821".into()), None).unwrap().is_ok());
+        drop(db); // Windows can't delete an open database file
         let _ = std::fs::remove_dir_all(dir);
     }
 }
