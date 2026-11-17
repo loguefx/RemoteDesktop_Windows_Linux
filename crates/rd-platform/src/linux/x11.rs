@@ -97,6 +97,48 @@ struct X11Capturer {
     /// XFixes is available (pointer image), and the serial of the last pointer sent.
     xfixes: bool,
     cursor_serial: Option<u32>,
+    /// The monitor's mode before "fit to window" changed it.
+    saved_mode: Option<SavedMode>,
+}
+
+#[derive(Clone)]
+struct SavedMode {
+    crtc: u32,
+    x: i16,
+    y: i16,
+    mode: u32,
+    rotation: x11rb::protocol::randr::Rotation,
+    outputs: Vec<u32>,
+    /// Screen (width, height, mm width, mm height) when it is resized with the monitor.
+    screen: Option<(u16, u16, u32, u32)>,
+}
+
+fn refresh(m: &x11rb::protocol::randr::ModeInfo) -> u32 {
+    let total = m.htotal as u64 * m.vtotal as u64;
+    if total == 0 { 0 } else { (m.dot_clock as u64 * 1000 / total) as u32 }
+}
+
+/// Set a CRTC's mode, resizing the X screen around it when it's the only monitor
+/// (grow the screen first, shrink it after, so the CRTC always fits).
+fn apply_mode(conn: &RustConnection, root: Window, m: &SavedMode) -> Result<()> {
+    let res = conn.randr_get_screen_resources_current(root)?.reply()?;
+    let mode = res.modes.iter().find(|x| x.id == m.mode).ok_or_else(|| anyhow!("mode is gone"))?;
+    let geo = conn.get_geometry(root)?.reply()?;
+    let grow = m.screen.is_some_and(|(w, h, _, _)| w > geo.width || h > geo.height);
+    if let (true, Some((w, h, mw, mh))) = (grow, m.screen) {
+        conn.randr_set_screen_size(root, w.max(geo.width), h.max(geo.height), mw, mh)?.check()?;
+    }
+    let r = conn
+        .randr_set_crtc_config(m.crtc, x11rb::CURRENT_TIME, res.config_timestamp, m.x, m.y, m.mode, m.rotation, &m.outputs)?
+        .reply()?;
+    if r.status != x11rb::protocol::randr::SetConfig::SUCCESS {
+        bail!("the X server refused {}x{} ({:?})", mode.width, mode.height, r.status);
+    }
+    if let Some((w, h, mw, mh)) = m.screen {
+        conn.randr_set_screen_size(root, w, h, mw, mh)?.check()?;
+    }
+    conn.flush()?;
+    Ok(())
 }
 
 impl X11Capturer {
@@ -132,6 +174,7 @@ impl X11Capturer {
             refreshed: Instant::now(),
             xfixes,
             cursor_serial: None,
+            saved_mode: None,
         };
         me.publish_origin();
         Ok(me)
@@ -239,10 +282,84 @@ impl X11Capturer {
 impl Drop for X11Capturer {
     fn drop(&mut self) {
         self.drop_shm();
+        if let Some(saved) = self.saved_mode.take() {
+            let _ = apply_mode(&self.conn, self.root, &saved);
+        }
     }
 }
 
 impl Capturer for X11Capturer {
+    fn set_resolution(&mut self, size: Option<(u32, u32)>) -> Result<(u32, u32)> {
+        match size {
+            None => {
+                if let Some(saved) = self.saved_mode.take() {
+                    apply_mode(&self.conn, self.root, &saved)?;
+                }
+            }
+            Some((w, h)) => {
+                let t = self.target().clone();
+                let res = self.conn.randr_get_screen_resources_current(self.root)?.reply()?;
+                let mut active = Vec::new();
+                for c in &res.crtcs {
+                    let info = self.conn.randr_get_crtc_info(*c, res.config_timestamp)?.reply()?;
+                    if info.mode != 0 {
+                        active.push((*c, info));
+                    }
+                }
+                let (crtc, info) = active
+                    .iter()
+                    .find(|(_, i)| i.x as i32 == t.x && i.y as i32 == t.y)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("couldn't find this monitor's RandR output"))?;
+                let output = *info.outputs.first().ok_or_else(|| anyhow!("monitor without an output"))?;
+                let out = self.conn.randr_get_output_info(output, res.config_timestamp)?.reply()?;
+                let alone = active.len() == 1;
+                // Only grow past the current size when this is the only monitor (the
+                // screen is resized to match); beside others, fit inside the current area.
+                let (mw, mh) = if alone { (w, h) } else { (w.min(t.width), h.min(t.height)) };
+                let best = res
+                    .modes
+                    .iter()
+                    .filter(|m| out.modes.contains(&m.id))
+                    .filter(|m| (m.width as u32) <= mw && (m.height as u32) <= mh && m.width >= 800 && m.height >= 600)
+                    .max_by_key(|m| (m.width as u32 * m.height as u32, refresh(m)))
+                    .ok_or_else(|| anyhow!("the monitor has no mode that fits {w}x{h}"))?;
+                if self.saved_mode.is_none() {
+                    let geo = self.conn.get_geometry(self.root)?.reply()?;
+                    let mm = self.conn.randr_get_screen_info(self.root)?.reply().ok();
+                    let (mmw, mmh) = mm
+                        .and_then(|i| i.sizes.get(i.size_id as usize).map(|s| (s.mwidth as u32, s.mheight as u32)))
+                        .unwrap_or((geo.width as u32 * 254 / 960, geo.height as u32 * 254 / 960));
+                    self.saved_mode = Some(SavedMode {
+                        crtc,
+                        x: info.x,
+                        y: info.y,
+                        mode: info.mode,
+                        rotation: info.rotation,
+                        outputs: info.outputs.clone(),
+                        screen: alone.then_some((geo.width, geo.height, mmw, mmh)),
+                    });
+                }
+                let target = SavedMode {
+                    crtc,
+                    x: info.x,
+                    y: info.y,
+                    mode: best.id,
+                    rotation: info.rotation,
+                    outputs: info.outputs.clone(),
+                    // Keep roughly 96 dpi when resizing the screen.
+                    screen: alone.then_some((best.width, best.height, best.width as u32 * 254 / 960, best.height as u32 * 254 / 960)),
+                };
+                apply_mode(&self.conn, self.root, &target)?;
+            }
+        }
+        self.refreshed = Instant::now() - Duration::from_secs(10);
+        std::thread::sleep(Duration::from_millis(300));
+        self.maybe_refresh();
+        let t = self.target();
+        Ok((t.width, t.height))
+    }
+
     fn cursor(&mut self) -> Option<CursorShape> {
         if !self.xfixes {
             return None;
@@ -318,6 +435,14 @@ struct X11Injector {
     root: Window,
     wheel: WheelAccumulator,
     origin: Origin,
+    /// Physical keyboards and mice switched off for the privacy screen.
+    disabled: Vec<u16>,
+}
+
+/// Where the ids of switched-off devices are kept, so they come back on after a crash.
+fn blocked_file() -> std::path::PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("rd-privacy-devices-{}", unsafe { libc::getuid() }))
 }
 
 impl X11Injector {
@@ -325,7 +450,32 @@ impl X11Injector {
         let (conn, root) = connect()?;
         conn.extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)?
             .ok_or_else(|| anyhow!("X server lacks the XTEST extension"))?;
-        Ok(Self { conn, root, wheel: WheelAccumulator::default(), origin })
+        let me = Self { conn, root, wheel: WheelAccumulator::default(), origin, disabled: Vec::new() };
+        // A previous agent that died with the privacy screen on left devices off.
+        if let Ok(ids) = std::fs::read_to_string(blocked_file()) {
+            let ids: Vec<u16> = ids.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+            let _ = me.set_devices_enabled(&ids, true);
+            let _ = std::fs::remove_file(blocked_file());
+        }
+        Ok(me)
+    }
+
+    /// Turn the X input devices `ids` on or off ("Device Enabled" property).
+    fn set_devices_enabled(&self, ids: &[u16], on: bool) -> Result<()> {
+        use x11rb::protocol::xinput::ConnectionExt as _;
+        let prop = self.conn.intern_atom(false, b"Device Enabled")?.reply()?.atom;
+        for id in ids {
+            let _ = self.conn.xinput_xi_change_property(
+                *id,
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                prop,
+                x11rb::protocol::xproto::AtomEnum::INTEGER.into(),
+                1,
+                &x11rb::protocol::xinput::XIChangePropertyAux::Data8(vec![on as u8]),
+            )?;
+        }
+        self.conn.flush()?;
+        Ok(())
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
@@ -354,6 +504,34 @@ fn x_button(b: MouseButton) -> u8 {
 }
 
 impl InputInjector for X11Injector {
+    fn block_local_input(&mut self, on: bool) -> Result<()> {
+        use x11rb::protocol::xinput::{ConnectionExt as _, DeviceType};
+        if !on {
+            let ids = std::mem::take(&mut self.disabled);
+            self.set_devices_enabled(&ids, true)?;
+            let _ = std::fs::remove_file(blocked_file());
+            return Ok(());
+        }
+        if !self.disabled.is_empty() {
+            return Ok(());
+        }
+        self.conn.xinput_xi_query_version(2, 0)?.reply().context("the X server has no XInput 2")?;
+        // ALL_DEVICES = 0. Physical devices only: XTest's own devices keep working.
+        let list = self.conn.xinput_xi_query_device(0u16)?.reply()?;
+        let ids: Vec<u16> = list
+            .infos
+            .iter()
+            .filter(|d| d.enabled && matches!(d.type_, DeviceType::SLAVE_POINTER | DeviceType::SLAVE_KEYBOARD))
+            .filter(|d| !String::from_utf8_lossy(&d.name).contains("XTEST"))
+            .map(|d| d.deviceid)
+            .collect();
+        let text: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let _ = std::fs::write(blocked_file(), text.join(" "));
+        self.set_devices_enabled(&ids, false)?;
+        self.disabled = ids;
+        Ok(())
+    }
+
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
         match *ev {
             InputEvent::MouseMove { x, y } => {
@@ -361,6 +539,11 @@ impl InputInjector for X11Injector {
                 let px = (ox + x.min(i16::MAX as u32) as i32).clamp(0, i16::MAX as i32) as i16;
                 let py = (oy + y.min(i16::MAX as u32) as i32).clamp(0, i16::MAX as i32) as i16;
                 self.fake(MOTION_NOTIFY, 0, px, py)?
+            }
+            InputEvent::MouseRelative { dx, dy } => {
+                // XTest: detail 1 = relative motion.
+                let c = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                self.conn.xtest_fake_input(MOTION_NOTIFY, 1, x11rb::CURRENT_TIME, x11rb::NONE, c(dx), c(dy), 0)?;
             }
             InputEvent::MouseButton { button, down } => {
                 self.fake(if down { BUTTON_PRESS } else { BUTTON_RELEASE }, x_button(button), 0, 0)?
@@ -381,4 +564,59 @@ impl InputInjector for X11Injector {
         self.conn.flush()?;
         Ok(())
     }
+}
+
+
+// ------------------------------------------------------------------ privacy screen
+
+/// X11 privacy screen: the monitor is switched off (DPMS) and kept off. Pictures are
+/// still captured from the X server.
+struct X11Privacy {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl crate::PrivacyScreen for X11Privacy {}
+
+impl Drop for X11Privacy {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+pub fn privacy_screen() -> Result<Box<dyn crate::PrivacyScreen>> {
+    use x11rb::protocol::dpms::{ConnectionExt as _, DPMSMode};
+    let (conn, _) = connect()?;
+    let no_dpms = || anyhow!("this X server can't switch the monitor off (it has no DPMS power control)");
+    let capable = conn.dpms_capable().map_err(|_| no_dpms())?.reply().map_err(|_| no_dpms())?;
+    if !capable.capable {
+        bail!("this monitor can't be switched off by the X server (no DPMS)");
+    }
+    let was_enabled = conn.dpms_info()?.reply()?.state;
+    conn.dpms_enable()?.check()?;
+    conn.dpms_force_level(DPMSMode::OFF)?.check()?;
+    conn.flush()?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = stop.clone();
+    let join = std::thread::Builder::new().name("privacy".into()).spawn(move || {
+        // Remote input wakes the monitor; switch it off again shortly after.
+        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(700));
+            if let Ok(Ok(i)) = conn.dpms_info().map(|c| c.reply()) {
+                if i.power_level != DPMSMode::OFF {
+                    let _ = conn.dpms_force_level(DPMSMode::OFF);
+                    let _ = conn.flush();
+                }
+            }
+        }
+        let _ = conn.dpms_force_level(DPMSMode::ON);
+        if !was_enabled {
+            let _ = conn.dpms_disable();
+        }
+        let _ = conn.flush();
+    })?;
+    Ok(Box::new(X11Privacy { stop, join: Some(join) }))
 }

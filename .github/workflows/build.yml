@@ -48,7 +48,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config clang libclang-dev \
-            libpipewire-0.3-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
+            libpipewire-0.3-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test

@@ -24,7 +24,7 @@ use rd_core::proto::*;
 use rd_core::tls::TlsAcceptor;
 use rd_core::PROTOCOL_VERSION;
 use rd_platform::Backend;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -56,6 +56,10 @@ pub struct Config {
     /// Dynamic DNS: (name, update URL with `{ip}`), so the app finds this computer after
     /// the router's internet address changes.
     pub ddns: Option<(String, String)>,
+    /// Ask the person at the computer before anyone connects.
+    pub ask_to_allow: bool,
+    /// Serve the browser viewer on the same port.
+    pub web: bool,
 }
 
 pub(crate) struct Shared {
@@ -68,6 +72,15 @@ pub(crate) struct Shared {
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     next_client: AtomicU32,
 }
+
+impl Shared {
+    pub(crate) fn web_enabled(&self) -> bool {
+        self.cfg.web
+    }
+}
+
+/// How long the person at the computer has to answer "Allow ... to connect?".
+const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 
 const IP_MAX_FAILURES: u32 = 10;
 const IP_WINDOW: Duration = Duration::from_secs(600);
@@ -104,6 +117,7 @@ pub async fn serve(cfg: Config, mut shutdown: watch::Receiver<bool>) -> Result<(
             os: std::env::consts::OS.to_string(),
             public_name: None,
             macs: crate::reach::mac_addresses(),
+            ask_to_allow: cfg.ask_to_allow,
         };
         if cfg.upnp {
             tokio::spawn(crate::reach::keep_port_mapped(addr.port(), reach.clone(), cfg.ddns.clone()));
@@ -179,6 +193,58 @@ where
         .await
         .map_err(|_| anyhow!("TLS handshake timeout"))?
         .context("TLS handshake")?;
+    // A browser speaks HTTP here (the browser viewer); the app sends a length prefix.
+    let mut first = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(60), tls.read_exact(&mut first))
+        .await
+        .map_err(|_| anyhow!("login timeout"))??;
+    let stream = Prefixed { head: first.to_vec(), inner: tls };
+    if crate::web::is_http(&first) {
+        return crate::web::serve(shared, stream, peer, ip).await;
+    }
+    session(shared, stream, peer, ip).await
+}
+
+/// A stream with some bytes already read off the front, put back.
+struct Prefixed<S> {
+    head: Vec<u8>,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.head.is_empty() {
+            let n = self.head.len().min(buf.remaining());
+            buf.put_slice(&self.head[..n]);
+            self.head.drain(..n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, b: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Sign-in and the session that follows, on an established (decrypted) stream. Also used
+/// by the browser viewer, over an in-memory pipe.
+pub(crate) async fn session<S>(shared: Arc<Shared>, mut tls: S, peer: String, ip: IpAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let hello: ClientHello = tokio::time::timeout(Duration::from_secs(60), read_msg(&mut tls))
         .await
         .map_err(|_| anyhow!("login timeout"))??;
@@ -208,8 +274,8 @@ where
     // Argon2 is deliberately slow: keep it off the async workers.
     let auth = {
         let shared = shared.clone();
-        let (username, cred) = (hello.username.clone(), hello.credential.clone());
-        tokio::task::spawn_blocking(move || shared.db.lock().unwrap().authenticate(&username, &cred)).await??
+        let (username, cred, code) = (hello.username.clone(), hello.credential.clone(), hello.code.clone());
+        tokio::task::spawn_blocking(move || shared.db.lock().unwrap().authenticate(&username, &cred, code.as_deref())).await??
     };
     let method = match hello.credential {
         Credential::Password(_) => "password",
@@ -218,6 +284,10 @@ where
     };
     let user = match auth {
         Ok(u) => u,
+        Err(crate::db::AuthError::NeedCode) => {
+            write_msg(&mut tls, &LoginResult::NeedCode).await?;
+            return Ok(());
+        }
         Err(e) => {
             note_failure(&shared, ip);
             shared.db.lock().unwrap().audit(Some(&hello.username), &peer, &format!("login failed ({method}): {e}"));
@@ -422,6 +492,10 @@ struct Viewer {
     tx: mpsc::UnboundedSender<HostMsg>,
     audio_tx: mpsc::Sender<AudioChunk>,
     wants_audio: bool,
+    /// Lock the computer if this viewer is the last to leave.
+    lock_on_leave: bool,
+    /// Asked for the privacy screen.
+    privacy: bool,
 }
 
 pub(crate) struct Desk {
@@ -435,6 +509,12 @@ pub(crate) struct Desk {
     audio_on: Mutex<bool>,
     /// The pointer's current look, for viewers that join later.
     cursor: Mutex<Option<CursorShape>>,
+    /// Privacy screen requested of the agent.
+    privacy_on: Mutex<bool>,
+    /// Viewer whose "fit to window" changed the resolution.
+    fit_owner: Mutex<Option<u32>>,
+    /// "Allow ... to connect?" questions waiting for the person at the computer.
+    asks: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<bool>>>,
 }
 
 impl Desk {
@@ -468,14 +548,24 @@ impl Desk {
         }
     }
 
+    /// Privacy screen on while any viewer with control wants it.
+    fn update_privacy(&self) {
+        let want = self.viewers.lock().unwrap().values().any(|v| v.privacy && v.perms.control);
+        let mut on = self.privacy_on.lock().unwrap();
+        if *on != want {
+            *on = want;
+            let _ = self.agent_tx.send(AgentCmd::Privacy(want));
+        }
+    }
+
     fn shutdown(&self, why: &str) {
         self.broadcast(HostMsg::Bye(why.to_string()), |_| true);
         let _ = self.agent_tx.send(AgentCmd::Input(InputEvent::ReleaseAll));
         let _ = self.agent_tx.send(AgentCmd::Stop);
         if let Some(mut p) = self.process.lock().unwrap().take() {
-            // Let the agent release keys and exit on its own first.
+            // Let the agent release keys, lock the screen and exit on its own first.
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(1500));
                 p.kill();
             });
         }
@@ -538,6 +628,9 @@ async fn join_desk(shared: &Arc<Shared>) -> Result<Arc<Desk>> {
         process: Mutex::new(Some(process)),
         audio_on: Mutex::new(false),
         cursor: Mutex::new(None),
+        privacy_on: Mutex::new(false),
+        fit_owner: Mutex::new(None),
+        asks: Mutex::new(HashMap::new()),
     });
 
     // daemon -> agent
@@ -597,6 +690,25 @@ async fn join_desk(shared: &Arc<Shared>) -> Result<Arc<Desk>> {
                         desk.broadcast(HostMsg::Cursor(c), |_| true);
                     }
                     AgentEvent::Cursor(_) => {}
+                    AgentEvent::Privacy { on, note } => {
+                        if !on {
+                            *desk.privacy_on.lock().unwrap() = false;
+                            for v in desk.viewers.lock().unwrap().values_mut() {
+                                v.privacy = false;
+                            }
+                        }
+                        desk.broadcast(HostMsg::Privacy { on, note }, |_| true);
+                    }
+                    AgentEvent::Resolution(note) => desk.broadcast(HostMsg::Status(note), |_| true),
+                    AgentEvent::Chat(text) => {
+                        let from = format!("{} (at the computer)", shared.host_name);
+                        desk.broadcast(HostMsg::Chat { from, text }, |_| true);
+                    }
+                    AgentEvent::Answer { id, allow } => {
+                        if let Some(tx) = desk.asks.lock().unwrap().remove(&id) {
+                            let _ = tx.send(allow);
+                        }
+                    }
                     AgentEvent::EndSessions => {
                         log::info!("the person at this computer ended the session");
                         shared.db.lock().unwrap().audit(None, "local", "sessions ended from the host screen");
@@ -668,12 +780,48 @@ where
     };
 
     let id = shared.next_client.fetch_add(1, Ordering::Relaxed);
+
+    // Ask the person at the computer first, if this computer is set up that way.
+    if shared.cfg.ask_to_allow {
+        let (ans_tx, ans_rx) = tokio::sync::oneshot::channel();
+        desk.asks.lock().unwrap().insert(id, ans_tx);
+        let _ = desk.agent_tx.send(AgentCmd::Ask { id, label: label.clone() });
+        write_msg(&mut c_wr, &HostMsg::Status(format!("Waiting for the person at {} to allow the connection...", shared.host_name)))
+            .await?;
+        let answer = tokio::time::timeout(ASK_TIMEOUT, ans_rx).await;
+        desk.asks.lock().unwrap().remove(&id);
+        let _ = desk.agent_tx.send(AgentCmd::AskDone(id));
+        let refused = match answer {
+            Ok(Ok(true)) => None,
+            Ok(Ok(false)) => Some(format!("The person at {} didn't allow the connection.", shared.host_name)),
+            Ok(Err(_)) => Some(format!("Nobody at {} could be asked (is anyone signed in there?).", shared.host_name)),
+            Err(_) => Some(format!("Nobody at {} answered.", shared.host_name)),
+        };
+        if let Some(why) = refused {
+            shared.db.lock().unwrap().audit(Some(&user.username), "local", "connection not allowed at the computer");
+            write_msg(&mut c_wr, &HostMsg::Bye(why)).await?;
+            // Stop the agent if nobody else is using it.
+            let mut slot = shared.desk.lock().await;
+            if desk.viewers.lock().unwrap().is_empty() && desk.asks.lock().unwrap().is_empty() {
+                if slot.as_ref().is_some_and(|d| Arc::ptr_eq(d, &desk)) {
+                    *slot = None;
+                }
+                drop(slot);
+                desk.shutdown("connection not allowed");
+            }
+            return Ok(());
+        }
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<HostMsg>();
     let (audio_tx, mut audio_rx) = mpsc::channel::<AudioChunk>(16);
     desk.viewers.lock().unwrap().insert(
         id,
-        Viewer { label, perms, tx: tx.clone(), audio_tx, wants_audio: false },
+        Viewer { label: label.clone(), perms, tx: tx.clone(), audio_tx, wants_audio: false, lock_on_leave: true, privacy: false },
     );
+    if *desk.privacy_on.lock().unwrap() {
+        let _ = tx.send(HostMsg::Privacy { on: true, note: None });
+    }
     desk.viewers_changed();
     let _ = tx.send(HostMsg::Status(desk.status.lock().unwrap().clone()));
     if let Some((list, current)) = desk.displays.lock().unwrap().clone() {
@@ -820,7 +968,11 @@ where
     let up = {
         let desk = desk.clone();
         let keyframe = keyframe.clone();
+        let label = label.clone();
         async move {
+            // Virtual controllers, unplugged when the viewer leaves.
+            let mut pads: HashMap<u8, crate::gamepad::Pad> = HashMap::new();
+            let mut pad_failed = false;
             loop {
                 match read_msg::<_, ClientMsg>(&mut c_rd).await? {
                     ClientMsg::Input(ev) if perms.control => {
@@ -874,6 +1026,59 @@ where
                     ClientMsg::Ping(v) => {
                         let _ = tx.send(HostMsg::Pong(v));
                     }
+                    ClientMsg::LockOnLeave(on) => {
+                        if let Some(v) = desk.viewers.lock().unwrap().get_mut(&id) {
+                            v.lock_on_leave = on;
+                        }
+                    }
+                    ClientMsg::Privacy(on) if perms.control => {
+                        if let Some(v) = desk.viewers.lock().unwrap().get_mut(&id) {
+                            v.privacy = on;
+                        }
+                        // Report "off" right away when someone else still keeps it on.
+                        desk.update_privacy();
+                        if !on && *desk.privacy_on.lock().unwrap() {
+                            let _ = tx.send(HostMsg::Privacy { on: true, note: Some("another viewer still has the privacy screen on".into()) });
+                        }
+                    }
+                    ClientMsg::Privacy(_) => {}
+                    ClientMsg::FitResolution(size) if perms.control => {
+                        let size = size.map(|(w, h)| (w.clamp(640, 7680), h.clamp(480, 4320)));
+                        *desk.fit_owner.lock().unwrap() = size.map(|_| id);
+                        let _ = desk.agent_tx.send(AgentCmd::SetResolution(size));
+                    }
+                    ClientMsg::FitResolution(_) => {}
+                    ClientMsg::Chat(text) => {
+                        let text: String = text.chars().filter(|c| !c.is_control() || *c == '\n').take(MAX_CHAT).collect();
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            let _ = desk.agent_tx.send(AgentCmd::Chat { from: label.clone(), text: text.clone() });
+                            desk.broadcast(HostMsg::Chat { from: label.clone(), text }, |v| !v.tx.same_channel(&tx));
+                        }
+                    }
+                    ClientMsg::Gamepad { pad, state } if perms.control && pad < MAX_PADS => match state {
+                        None => {
+                            pads.remove(&pad);
+                        }
+                        Some(s) => {
+                            if !pads.contains_key(&pad) && !pad_failed {
+                                let who = label.clone();
+                                match tokio::task::spawn_blocking(move || crate::gamepad::Pad::plug(&who)).await? {
+                                    Ok(p) => {
+                                        pads.insert(pad, p);
+                                    }
+                                    Err(e) => {
+                                        pad_failed = true;
+                                        let _ = tx.send(HostMsg::Status(format!("controller: {e:#}")));
+                                    }
+                                }
+                            }
+                            if let Some(p) = pads.get(&pad) {
+                                p.update(s);
+                            }
+                        }
+                    },
+                    ClientMsg::Gamepad { .. } => {}
                     ClientMsg::Disconnect => break,
                 }
             }
@@ -889,20 +1094,30 @@ where
     // Leave the desk; stop the agent when the last viewer goes.
     let _ = desk.agent_tx.send(AgentCmd::Input(InputEvent::ReleaseAll));
     let mut slot = shared.desk.lock().await;
-    let empty = {
+    let (empty, lock) = {
         let mut viewers = desk.viewers.lock().unwrap();
-        viewers.remove(&id);
-        viewers.is_empty()
+        let me = viewers.remove(&id);
+        (viewers.is_empty(), me.is_some_and(|v| v.lock_on_leave && v.perms.control))
     };
+    if desk.fit_owner.lock().unwrap().take_if(|o| *o == id).is_some() {
+        let _ = desk.agent_tx.send(AgentCmd::SetResolution(None));
+    }
     if empty {
         if slot.as_ref().is_some_and(|d| Arc::ptr_eq(d, &desk)) {
             *slot = None;
         }
         drop(slot);
+        // Not when the person at the computer ended it: they're right there.
+        let ended_locally = result.as_ref().is_ok() && desk.process.lock().unwrap().is_none();
+        if lock && !ended_locally {
+            log::info!("locking the computer: the last viewer left");
+            let _ = desk.agent_tx.send(AgentCmd::Lock);
+        }
         desk.shutdown("session ended");
     } else {
         drop(slot);
         desk.update_audio();
+        desk.update_privacy();
         desk.viewers_changed();
     }
     log::info!("viewer '{}' left", user.username);
@@ -949,7 +1164,7 @@ where
                 Ok(Some(u)) if !u.disabled => u,
                 _ => return AdminResponse::Error("your account no longer exists or is disabled".into()),
             };
-            match admin_request(&mut db, &me, req) {
+            match admin_request(&mut db, &me, &shared2.host_name, req) {
                 Ok(r) => r,
                 Err(e) => AdminResponse::Error(format!("{e:#}")),
             }
@@ -959,7 +1174,7 @@ where
     }
 }
 
-fn admin_request(db: &mut Db, me: &UserInfo, req: AdminRequest) -> Result<AdminResponse> {
+fn admin_request(db: &mut Db, me: &UserInfo, host_name: &str, req: AdminRequest) -> Result<AdminResponse> {
     let admin = me.role == Role::Admin;
     let need_admin = || -> Result<()> {
         if admin {
@@ -1034,6 +1249,21 @@ fn admin_request(db: &mut Db, me: &UserInfo, req: AdminRequest) -> Result<AdminR
         AdminRequest::RevokeDevice { id } => {
             db.revoke_device(id, if admin { None } else { Some(&me.username) })?;
             audit(db, format!("revoked device {id}"));
+            AdminResponse::Ok
+        }
+        AdminRequest::TotpSetup => {
+            let secret = db.totp_begin(&me.username)?;
+            AdminResponse::Totp { secret: crate::totp::base32(&secret), uri: crate::totp::uri(&secret, &me.username, host_name) }
+        }
+        AdminRequest::TotpEnable { code } => {
+            db.totp_enable(&me.username, &code)?;
+            audit(db, format!("turned on two-step sign-in for {}", me.username));
+            AdminResponse::Ok
+        }
+        AdminRequest::TotpDisable { username } => {
+            self_or_admin(&username)?;
+            db.totp_disable(&username)?;
+            audit(db, format!("turned off two-step sign-in for {username}"));
             AdminResponse::Ok
         }
     })

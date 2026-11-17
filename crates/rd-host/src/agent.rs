@@ -35,6 +35,15 @@ pub struct AgentOptions {
 /// audio callback never blocks; file downloads are bounded by their ack window.
 pub type EventTx = mpsc::UnboundedSender<AgentEvent>;
 
+/// Work for the input thread: it owns the injector, so blocking local input for the
+/// privacy screen happens there too (Windows only lets the blocking thread inject).
+enum InputCmd {
+    Event(InputEvent),
+    Privacy(bool),
+    /// Undo the privacy screen and answer, before the agent exits.
+    Finish(std_mpsc::Sender<()>),
+}
+
 pub async fn run(opts: AgentOptions) -> Result<()> {
     let token = std::env::var(TOKEN_ENV).context("RD_AGENT_TOKEN not set (the agent is started by the host service)")?;
     std::env::remove_var(TOKEN_ENV);
@@ -47,8 +56,9 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
     // adding latency. Everything else goes through the unbounded side channel.
     let (frame_tx, mut frame_rx) = mpsc::channel::<AgentEvent>(2);
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (input_tx, input_rx) = std_mpsc::channel::<InputEvent>();
+    let (input_tx, input_rx) = std_mpsc::channel::<InputCmd>();
     let (display_tx, display_rx) = std_mpsc::channel::<u32>();
+    let (res_tx, res_rx) = std_mpsc::channel::<Option<(u32, u32)>>();
     let (file_tx, file_rx) = std_mpsc::channel::<(u32, FileRequest)>();
     let keyframe = Arc::new(AtomicBool::new(true));
     let stop = Arc::new(AtomicBool::new(false));
@@ -57,7 +67,7 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
         let (keyframe, stop, frame_tx, evt_tx) = (keyframe.clone(), stop.clone(), frame_tx.clone(), evt_tx.clone());
         let (backend, fps) = (opts.backend, opts.fps);
         std::thread::Builder::new().name("capture".into()).spawn(move || {
-            if let Err(e) = capture_thread(backend, fps, keyframe, stop, frame_tx, evt_tx.clone(), input_rx, display_rx) {
+            if let Err(e) = capture_thread(backend, fps, keyframe, stop, frame_tx, evt_tx.clone(), input_rx, display_rx, res_rx) {
                 log::error!("capture failed: {e:#}");
                 let _ = evt_tx.send(AgentEvent::Error(format!("{e:#}")));
             }
@@ -90,16 +100,29 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
         loop {
             match read_msg::<_, AgentCmd>(&mut rd).await? {
                 AgentCmd::Input(ev) => {
-                    if input_tx.send(ev).is_err() {
+                    if input_tx.send(InputCmd::Event(ev)).is_err() {
                         break;
                     }
                 }
                 AgentCmd::CtrlAltDel => {
                     // Non-Windows hosts: it's just a key chord.
                     for (code, down) in [(29, true), (56, true), (111, true), (111, false), (56, false), (29, false)] {
-                        let _ = input_tx.send(InputEvent::Key { code, down });
+                        let _ = input_tx.send(InputCmd::Event(InputEvent::Key { code, down }));
                     }
                 }
+                AgentCmd::Privacy(on) => {
+                    let _ = input_tx.send(InputCmd::Privacy(on));
+                }
+                AgentCmd::SetResolution(size) => {
+                    let _ = res_tx.send(size);
+                }
+                AgentCmd::Lock => {
+                    let as_user = opts.impersonate_console_user;
+                    let _ = tokio::task::spawn_blocking(move || lock_screen(as_user)).await;
+                }
+                AgentCmd::Chat { from, text } => notice.chat(&from, &text),
+                AgentCmd::Ask { id, label } => notice.ask(id, &label),
+                AgentCmd::AskDone(id) => notice.ask_done(id),
                 AgentCmd::RequestKeyframe => keyframe.store(true, Ordering::Relaxed),
                 AgentCmd::SelectDisplay(i) => {
                     let _ = display_tx.send(i);
@@ -131,6 +154,11 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
         r = reader => { if let Err(e) = r { log::debug!("daemon link closed: {e:#}"); } }
         r = writer => { if let Ok(Err(e)) = r { log::debug!("daemon link write failed: {e:#}"); } }
     }
+    // Give the keyboard and mouse back (privacy screen) before the process exits.
+    let (done_tx, done_rx) = std_mpsc::channel();
+    if input_tx.send(InputCmd::Finish(done_tx)).is_ok() {
+        let _ = tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(2))).await;
+    }
     stop.store(true, Ordering::Relaxed);
     log::info!("agent session ended");
     Ok(())
@@ -144,8 +172,9 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     frames: mpsc::Sender<AgentEvent>,
     events: EventTx,
-    input_rx: std_mpsc::Receiver<InputEvent>,
+    input_rx: std_mpsc::Receiver<InputCmd>,
     display_rx: std_mpsc::Receiver<u32>,
+    res_rx: std_mpsc::Receiver<Option<(u32, u32)>>,
 ) -> Result<()> {
     let session = rd_platform::open(backend)?;
     let backend_name = session.backend.to_string();
@@ -154,15 +183,56 @@ fn capture_thread(
 
     // Input runs on its own thread so a slow capture never delays clicks/keys.
     let input_stop = stop.clone();
+    let input_events = events.clone();
+    let resolved = session.backend;
     std::thread::Builder::new().name("input".into()).spawn(move || {
-        while let Ok(ev) = input_rx.recv() {
-            if input_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            if let Err(e) = injector.inject(&ev) {
-                log::warn!("input injection failed: {e:#}");
+        let mut screen: Option<Box<dyn rd_platform::PrivacyScreen>> = None;
+        while let Ok(cmd) = input_rx.recv() {
+            match cmd {
+                InputCmd::Event(ev) => {
+                    if input_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Err(e) = injector.inject(&ev) {
+                        log::warn!("input injection failed: {e:#}");
+                    }
+                }
+                InputCmd::Privacy(true) => {
+                    let mut notes = Vec::new();
+                    if screen.is_none() {
+                        match rd_platform::privacy_screen(resolved) {
+                            Ok(s) => screen = Some(s),
+                            Err(e) => notes.push(format!("{e:#}")),
+                        }
+                    }
+                    if let Err(e) = injector.block_local_input(true) {
+                        notes.push(format!("{e:#}"));
+                    }
+                    let on = screen.is_some();
+                    if !on {
+                        let _ = injector.block_local_input(false);
+                    }
+                    log::info!("privacy screen {}", if on { "on" } else { "unavailable" });
+                    let note = (!notes.is_empty()).then(|| {
+                        if on { format!("Privacy screen on, but: {}", notes.join("; ")) } else { format!("Privacy screen unavailable: {}", notes.join("; ")) }
+                    });
+                    let _ = input_events.send(AgentEvent::Privacy { on, note });
+                }
+                InputCmd::Privacy(false) => {
+                    screen = None;
+                    let _ = injector.block_local_input(false);
+                    let _ = input_events.send(AgentEvent::Privacy { on: false, note: None });
+                }
+                InputCmd::Finish(done) => {
+                    screen = None;
+                    let _ = injector.inject(&InputEvent::ReleaseAll);
+                    let _ = injector.block_local_input(false);
+                    let _ = done.send(());
+                    break;
+                }
             }
         }
+        drop(screen);
         // Dropping the injector releases anything still held.
     })?;
 
@@ -180,6 +250,18 @@ fn capture_thread(
     while !stop.load(Ordering::Relaxed) {
         if let Some(c) = capturer.cursor() {
             let _ = events.send(AgentEvent::Cursor(c));
+        }
+        if let Some(size) = res_rx.try_iter().last() {
+            match capturer.set_resolution(size) {
+                Ok((w, h)) => {
+                    log::info!("display resolution now {w}x{h}");
+                    encoder.force_keyframe();
+                    send_displays(capturer.as_ref());
+                }
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Resolution(format!("Couldn't fit the resolution: {e:#}")));
+                }
+            }
         }
         if let Some(index) = display_rx.try_iter().last() {
             match capturer.select_display(index) {
@@ -251,5 +333,55 @@ pub fn snapshot(backend: Backend, display: Option<u32>, out: &std::path::Path) -
         if Instant::now() > deadline {
             anyhow::bail!("no frame within 30 s");
         }
+    }
+}
+
+/// Lock the computer (the last viewer left). Windows: as the signed-in user, since
+/// only their own process can lock their session. Linux: the session's screen locker.
+fn lock_screen(as_console_user: bool) {
+    #[cfg(windows)]
+    {
+        let exe = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32")
+            .join("rundll32.exe");
+        let args = vec!["user32.dll,LockWorkStation".to_string()];
+        match crate::spawn::spawn_ui(&exe, &args, &[], as_console_user) {
+            // rundll32 exits by itself; don't kill it.
+            Ok(p) => std::mem::forget(p),
+            Err(e) => log::warn!("couldn't lock the computer: {e:#}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = as_console_user;
+        let session = std::env::var("XDG_SESSION_ID").ok().filter(|s| !s.is_empty());
+        let mut tries: Vec<Vec<String>> = vec![vec![
+            "dbus-send".into(),
+            "--session".into(),
+            // Wait for the answer, so "no screen locker" counts as a failure.
+            "--print-reply".into(),
+            "--type=method_call".into(),
+            "--dest=org.freedesktop.ScreenSaver".into(),
+            "/ScreenSaver".into(),
+            "org.freedesktop.ScreenSaver.Lock".into(),
+        ]];
+        if let Some(s) = session {
+            tries.push(vec!["loginctl".into(), "lock-session".into(), s]);
+        }
+        tries.push(vec!["loginctl".into(), "lock-sessions".into()]);
+        tries.push(vec!["xdg-screensaver".into(), "lock".into()]);
+        for t in tries {
+            let ok = std::process::Command::new(&t[0])
+                .args(&t[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                log::info!("locked the screen with {}", t[0]);
+                return;
+            }
+        }
+        log::warn!("couldn't lock the screen (no screen locker answered)");
     }
 }

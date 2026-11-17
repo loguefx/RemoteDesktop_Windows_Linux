@@ -19,12 +19,36 @@ pub struct Response {
 
 /// `GET url` (https only). `extra_headers` are `Name: value` lines.
 pub async fn get(url: &str, extra_headers: &[(&str, &str)]) -> Result<Response> {
-    tokio::time::timeout(Duration::from_secs(15), get_inner(url, extra_headers))
+    let r = tokio::time::timeout(Duration::from_secs(15), get_inner(url, extra_headers, MAX_BODY))
         .await
-        .map_err(|_| anyhow!("timed out"))?
+        .map_err(|_| anyhow!("timed out"))??;
+    Ok(Response { status: r.status, body: String::from_utf8_lossy(&r.body).into_owned() })
 }
 
-async fn get_inner(url: &str, extra_headers: &[(&str, &str)]) -> Result<Response> {
+/// Download a file of at most `max` bytes, following redirects (GitHub release assets
+/// redirect to a storage host).
+pub async fn download(url: &str, max: usize) -> Result<Vec<u8>> {
+    let mut url = url.to_string();
+    for _ in 0..5 {
+        let r = tokio::time::timeout(Duration::from_secs(600), get_inner(&url, &[], max))
+            .await
+            .map_err(|_| anyhow!("download timed out"))??;
+        match (r.status, r.location) {
+            (200, _) => return Ok(r.body),
+            (301 | 302 | 303 | 307 | 308, Some(loc)) => url = loc,
+            (s, _) => bail!("download failed (HTTP {s})"),
+        }
+    }
+    bail!("too many redirects")
+}
+
+struct Raw {
+    status: u16,
+    location: Option<String>,
+    body: Vec<u8>,
+}
+
+async fn get_inner(url: &str, extra_headers: &[(&str, &str)], max: usize) -> Result<Raw> {
     let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("only https:// addresses are supported"))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -72,14 +96,20 @@ async fn get_inner(url: &str, extra_headers: &[(&str, &str)]) -> Result<Response
             break;
         }
         raw.extend_from_slice(&buf[..n]);
-        if raw.len() > MAX_BODY + 64 * 1024 {
+        if raw.len() > max + 64 * 1024 {
             bail!("response too large");
         }
     }
-    parse_response(&raw)
+    parse_raw(&raw, max)
 }
 
+#[cfg(test)]
 fn parse_response(raw: &[u8]) -> Result<Response> {
+    let r = parse_raw(raw, MAX_BODY)?;
+    Ok(Response { status: r.status, body: String::from_utf8_lossy(&r.body).into_owned() })
+}
+
+fn parse_raw(raw: &[u8], max: usize) -> Result<Raw> {
     let end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| anyhow!("bad HTTP response"))?;
     let head = String::from_utf8_lossy(&raw[..end]);
     let mut lines = head.lines();
@@ -88,14 +118,21 @@ fn parse_response(raw: &[u8]) -> Result<Response> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("bad HTTP status line"))?;
-    let chunked = lines.any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
-        })
-    });
+    let (mut chunked, mut location) = (false, None);
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+            if k.trim().eq_ignore_ascii_case("location") && v.trim().starts_with("https://") {
+                location = Some(v.trim().to_string());
+            }
+        }
+    }
     let body = &raw[end + 4..];
-    let body = if chunked { dechunk(body)? } else { body.to_vec() };
-    Ok(Response { status, body: String::from_utf8_lossy(&body[..body.len().min(MAX_BODY)]).into_owned() })
+    let mut body = if chunked { dechunk(body)? } else { body.to_vec() };
+    body.truncate(max);
+    Ok(Raw { status, location, body })
 }
 
 fn dechunk(mut b: &[u8]) -> Result<Vec<u8>> {

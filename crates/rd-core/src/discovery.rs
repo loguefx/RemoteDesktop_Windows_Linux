@@ -45,6 +45,8 @@ pub struct Announce {
     pub public_name: Option<String>,
     /// Network adapter hardware addresses, for Wake-on-LAN (at most [`MAX_MACS`]).
     pub macs: Vec<[u8; 6]>,
+    /// The person at the computer is asked before anyone connects.
+    pub ask_to_allow: bool,
 }
 
 pub const MAX_MACS: usize = 3;
@@ -142,6 +144,7 @@ mod tests {
             os: "windows".into(),
             public_name: Some(format!("{}.duckdns.org:47800", "d".repeat(63))),
             macs: vec![[0xaa; 6]; MAX_MACS],
+            ask_to_allow: true,
         };
         let b = encode_reply(&a).expect("fits");
         assert!(b.len() <= QUERY_LEN);

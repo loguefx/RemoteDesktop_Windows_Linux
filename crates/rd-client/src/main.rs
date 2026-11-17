@@ -19,10 +19,13 @@ mod config;
 mod discover;
 mod conn;
 mod gui;
+mod keyhook;
 mod keymap;
 mod notice;
+mod pads;
 mod session;
 mod setup;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -101,6 +104,9 @@ enum Cmd {
         /// Don't ask the router to forward a port; reachable on this network only.
         #[arg(long)]
         no_internet: bool,
+        /// Ask the person at this computer before anyone connects.
+        #[arg(long)]
+        ask_to_allow: bool,
         /// Turn remote access off instead.
         #[arg(long, conflicts_with_all = ["name", "no_internet"])]
         off: bool,
@@ -298,7 +304,7 @@ fn main() -> Result<()> {
     match cmd {
         Cmd::Connect { host } => gui::run(rt, Some(host)),
         Cmd::Notice { connect } => gui::run_notice(rt, &connect),
-        Cmd::Setup { name, no_internet, off } => {
+        Cmd::Setup { name, no_internet, ask_to_allow, off } => {
             if off {
                 setup::turn_off()?;
                 println!("Remote access is off for this computer.");
@@ -315,6 +321,7 @@ fn main() -> Result<()> {
                 ddns: None,
                 ddns_off: false,
                 wake_on_lan: true,
+                ask_to_allow,
             };
             setup::validate(&req).map_err(|e| anyhow::anyhow!(e))?;
             setup::set_up(&req)?;
@@ -465,7 +472,8 @@ async fn snapshot(auth: Auth, out: std::path::PathBuf, move_mouse: Option<(u32, 
                 }
             }
             HostMsg::Viewers(v) => println!("viewers: {}", v.join(", ")),
-            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } | HostMsg::Pong(_) | HostMsg::Cursor(_) => {}
+            HostMsg::Clipboard(_) | HostMsg::Audio(_) | HostMsg::Files(_) | HostMsg::Video(_) | HostMsg::Codec { .. } | HostMsg::Pong(_) | HostMsg::Cursor(_) | HostMsg::Privacy { .. } => {}
+            HostMsg::Chat { from, text } => println!("chat from {from}: {text}"),
             HostMsg::Frame(f) => {
                 dec.apply(&f)?;
                 if let (Some((x, y)), false) = (move_mouse, moved) {

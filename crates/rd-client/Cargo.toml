@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["gamepads"]
+# Game controllers in gaming mode (on Linux this needs libudev, part of systemd).
+gamepads = ["dep:gilrs"]
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
@@ -14,6 +19,7 @@ tokio.workspace = true
 serde.workspace = true
 rd-core = { workspace = true, features = ["clipboard", "h264", "p2p"] }
 serde_json = "1"
+sha2 = "0.10"
 rpassword = "7"
 if-addrs = "0.13"
 socket2 = "0.6"
@@ -27,3 +33,20 @@ glow = "0.16"
 cpal = "0.15"
 # tokio backend: the Wayland capture code uses ashpd with tokio, and ashpd allows only one.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# Game controllers, forwarded to the remote computer in gaming mode.
+gilrs = { version = "0.11", optional = true }
+# QR code for setting up two-step sign-in in an authenticator app.
+qrcode = { version = "0.14", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# Low-level keyboard hook: system shortcuts (Windows key, Alt+Tab) for the remote computer.
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keyboard grab on X11 for system shortcuts.
+x11rb = "0.13"

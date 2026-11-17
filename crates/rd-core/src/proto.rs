@@ -127,6 +127,8 @@ pub struct UserInfo {
     pub perms: Permissions,
     pub has_pin: bool,
     pub disabled: bool,
+    /// Two-step sign-in (an authenticator app code) is on.
+    pub has_totp: bool,
 }
 
 impl UserInfo {
@@ -172,6 +174,8 @@ pub struct ClientHello {
     pub mode: Mode,
     /// This device's name, shown on the host while connected ("Laptop (windows)").
     pub device: String,
+    /// Authenticator app code, for accounts with two-step sign-in.
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +186,8 @@ pub enum LoginResult {
         device_token: Option<String>,
     },
     Denied(String),
+    /// The account has two-step sign-in: send the same credential again with a `code`.
+    NeedCode,
 }
 
 // ---------------------------------------------------------------- desktop session
@@ -199,6 +205,8 @@ pub enum MouseButton {
 pub enum InputEvent {
     /// Absolute position in pixels of the currently selected display.
     MouseMove { x: u32, y: u32 },
+    /// Relative motion in pixels (gaming mode: the pointer is locked in the viewer).
+    MouseRelative { dx: i32, dy: i32 },
     MouseButton { button: MouseButton, down: bool },
     /// Scroll in 1/120-notch units (Windows WHEEL_DELTA convention). Positive dy = away from user.
     Wheel { dx: i32, dy: i32 },
@@ -385,6 +393,27 @@ impl CursorShape {
     }
 }
 
+/// Longest chat message (characters).
+pub const MAX_CHAT: usize = 2000;
+
+/// One game controller's state, in XInput terms (buttons use the XInput bit mask:
+/// 0x1 up, 0x2 down, 0x4 left, 0x8 right, 0x10 start, 0x20 back, 0x40 left stick,
+/// 0x80 right stick, 0x100 LB, 0x200 RB, 0x400 guide, 0x1000 A, 0x2000 B, 0x4000 X,
+/// 0x8000 Y). Sticks are -32768..32767 with up positive; triggers 0..255.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GamepadState {
+    pub buttons: u16,
+    pub lt: u8,
+    pub rt: u8,
+    pub lx: i16,
+    pub ly: i16,
+    pub rx: i16,
+    pub ry: i16,
+}
+
+/// Most controllers one viewer can attach.
+pub const MAX_PADS: u8 = 4;
+
 /// Download chunks in flight before the agent waits for `Ack`s.
 pub const FILE_WINDOW: usize = 8;
 
@@ -413,6 +442,17 @@ pub enum ClientMsg {
     SetCodec(VideoCodec),
     /// Round-trip measurement; the host answers `Pong` with the same value.
     Ping(u64),
+    /// Lock the remote computer when this viewer is the last to leave (default on).
+    LockOnLeave(bool),
+    /// Blank the remote monitor and block its keyboard and mouse while connected.
+    Privacy(bool),
+    /// Change the remote display's resolution to fit this size (physical pixels), or
+    /// `None` to put it back.
+    FitResolution(Option<(u32, u32)>),
+    /// A chat message to the person at the remote computer (and other viewers).
+    Chat(String),
+    /// Controller `pad` (0..MAX_PADS) changed; `None` = unplugged.
+    Gamepad { pad: u8, state: Option<GamepadState> },
     Disconnect,
 }
 
@@ -435,6 +475,10 @@ pub enum HostMsg {
     Pong(u64),
     /// The remote pointer's look changed (also sent when a viewer joins).
     Cursor(CursorShape),
+    /// The privacy screen is on or off; `note` explains why it couldn't be turned on.
+    Privacy { on: bool, note: Option<String> },
+    /// A chat message: `from` is "user on device", or the host's name for the person there.
+    Chat { from: String, text: String },
     /// Session ended by the host.
     Bye(String),
 }
@@ -457,6 +501,12 @@ pub enum AdminRequest {
     /// Admins see every device; users see their own.
     ListDevices,
     RevokeDevice { id: i64 },
+    /// Start setting up two-step sign-in for yourself: answers `Totp`.
+    TotpSetup,
+    /// Finish setting it up with a code from the authenticator app.
+    TotpEnable { code: String },
+    /// Turn two-step sign-in off (your own, or anyone's for admins).
+    TotpDisable { username: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,6 +515,8 @@ pub enum AdminResponse {
     User(UserInfo),
     Users(Vec<UserInfo>),
     Devices(Vec<DeviceInfo>),
+    /// New two-step secret (base32) and its `otpauth://` link for a QR code.
+    Totp { secret: String, uri: String },
     Error(String),
 }
 
@@ -489,6 +541,18 @@ pub enum AgentCmd {
     CtrlAltDel,
     /// Who is connected ("user on device"); empty = nobody. Shown on the host's screen.
     Viewers(Vec<String>),
+    /// Lock the computer (the last viewer left).
+    Lock,
+    /// Privacy screen on or off.
+    Privacy(bool),
+    /// Fit the captured display to this size, or `None` to restore it.
+    SetResolution(Option<(u32, u32)>),
+    /// Chat message from a viewer, for the window on the host's screen.
+    Chat { from: String, text: String },
+    /// Ask the person at the computer whether `label` may connect (request `id`).
+    Ask { id: u32, label: String },
+    /// Request `id` was answered or given up on: take the question down.
+    AskDone(u32),
     Stop,
 }
 
@@ -504,5 +568,13 @@ pub enum AgentEvent {
     EndSessions,
     /// The pointer's look changed.
     Cursor(CursorShape),
+    /// Privacy screen state, with the reason when it couldn't be turned on.
+    Privacy { on: bool, note: Option<String> },
+    /// The resolution couldn't be changed (or was, with a note).
+    Resolution(String),
+    /// The person at the computer typed a chat message.
+    Chat(String),
+    /// The person at the computer answered request `id`.
+    Answer { id: u32, allow: bool },
     Error(String),
 }

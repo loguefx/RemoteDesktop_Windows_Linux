@@ -158,6 +158,7 @@ async fn portal_main(
             InputEvent::MouseMove { x, y } => {
                 rd.notify_pointer_motion_absolute(&session, node_id, x as f64, y as f64).await
             }
+            InputEvent::MouseRelative { dx, dy } => rd.notify_pointer_motion(&session, dx as f64, dy as f64).await,
             InputEvent::MouseButton { button, down } => {
                 let code = match button {
                     MouseButton::Left => BTN_LEFT,

@@ -115,6 +115,73 @@ other on the local network, and the app remembers how to reach them afterwards.
   `viewers\t...` lines and answers `disconnect`, which becomes `AgentEvent::EndSessions`: the daemon
   closes the desk and every viewer gets *The person at NAME ended the session.*
 - It closes when the agent's connection drops. Without `rd-client` installed, Linux uses `notify-send`.
+- **Asking first** (setting `ask_to_allow`): after sign-in the daemon sends `AgentCmd::Ask { id, label }`
+  and waits up to 60 s. The window shows *Allow* / *Don't allow* (`ask	`, `askdone	` lines; answers
+  `allow	<id>` / `deny	<id>` become `AgentEvent::Answer`). If the window can't start (nobody signed
+  in), the agent answers no at once.
+- **Chat:** `ClientMsg::Chat` is forwarded to the other viewers (`HostMsg::Chat`) and to the window
+  (`AgentCmd::Chat`, `chat	<from>	<text>`); the window's `chat	<text>` comes back as
+  `AgentEvent::Chat` and goes to every viewer from "NAME (at the computer)".
+
+## Session options
+
+- **Lock on leave** (`ClientMsg::LockOnLeave`, default on): when the last viewer leaves and it had
+  control, the daemon sends `AgentCmd::Lock` before stopping the agent. Windows runs
+  `rundll32 user32.dll,LockWorkStation` as the console user; Linux tries the session's
+  `org.freedesktop.ScreenSaver.Lock`, `loginctl lock-session`, `lock-sessions`, `xdg-screensaver lock`.
+- **Privacy screen** (`ClientMsg::Privacy`): on while any viewer with control wants it. The agent's
+  input thread both blocks local input (`InputInjector::block_local_input`: Windows `BlockInput` on the
+  injecting thread; X11 disables the physical XInput devices, recording their ids under
+  `$XDG_RUNTIME_DIR` so a crashed agent's successor turns them back on) and starts
+  `rd_platform::privacy_screen` (Windows: a topmost click-through black window with
+  `WDA_EXCLUDEFROMCAPTURE`; X11: DPMS off, re-forced every 0.7 s). The result comes back as
+  `HostMsg::Privacy { on, note }`.
+- **Fit resolution** (`ClientMsg::FitResolution(Some((w, h)))`): the capture thread calls
+  `Capturer::set_resolution`, which picks the largest mode the monitor offers that fits (Windows
+  `EnumDisplaySettings` + `ChangeDisplaySettingsEx` without saving to the registry; X11 RandR CRTC
+  mode, resizing the screen when it's the only monitor). `None`, the viewer leaving, or the agent
+  stopping puts the original back.
+- **Gaming mode** (client only): the window grabs the pointer (locked, else confined), raw
+  `DeviceEvent::MouseMotion` becomes `InputEvent::MouseRelative`, and gilrs controllers are sent as
+  `ClientMsg::Gamepad { pad, state }` (XInput-style state). The daemon plugs a virtual pad per
+  viewer and pad: ViGEmBus Xbox 360 on Windows, `/dev/uinput` on Linux.
+- **System shortcuts** (client only): Windows installs a `WH_KEYBOARD_LL` hook that swallows the
+  Windows key, Alt+Tab/Esc/F4/Space and Ctrl+Esc while the session window is in front and sends them
+  as key events; X11 grabs the keyboard while the window has focus.
+
+## Two-step sign-in
+
+- `users.totp_secret` (hex), `totp_pending` (during setup) and `totp_step` (last time step used).
+- `Db::authenticate(user, credential, code)`: with a secret and no code it returns `NeedCode` before
+  checking anything (so asking reveals nothing about the PIN); otherwise the PIN/password and the
+  RFC 6238 code (SHA-1, 6 digits, 30 s, ±1 step, newer than `totp_step`) must both be right, and a
+  failure counts like a wrong PIN. Device tokens skip the code.
+- `LoginResult::NeedCode` tells the client to sign in again with `ClientHello.code`.
+- Setup: `AdminRequest::TotpSetup` → `AdminResponse::Totp { secret (base32), uri (otpauth://) }`,
+  then `TotpEnable { code }`. `TotpDisable { username }` for yourself or (admins) anyone.
+
+## Browser viewer
+
+- After the TLS handshake the daemon reads 4 bytes: `GET ` (or `HEAD`/`POST`) means HTTP, anything
+  else is the app's length prefix (always < 64 MiB, so never ASCII). The bytes are put back with a
+  small `Prefixed` stream wrapper.
+- `GET /` serves `rd-host/src/web/index.html` (one file, strict CSP, `X-Frame-Options: DENY`).
+- `GET /ws` upgrades to a WebSocket (handshake and framing in `web.rs`; the `Origin` must match the
+  `Host`). The page's JSON `login` becomes a normal `ClientHello`, and `daemon::session` runs on one
+  end of a `tokio::io::duplex` pipe while the gateway translates the other end:
+  - `HostMsg::Frame` → binary `[1, w, h, key, n, (x, y, w, h, len, lz4 data)...]`; the page decodes
+    LZ4 blocks and BGR tiles itself.
+  - `HostMsg::Video` → binary `[2, w, h, key, Annex B]`, decoded with WebCodecs (`avc1.PPCCLL` from
+    the SPS).
+  - everything else ↔ small JSON messages (`{"t": "move", ...}`, `{"t": "status", ...}`).
+- Sound, files and non-text clipboard aren't bridged.
+
+## Updates
+
+`rd-client` reads the latest GitHub release, picks `rd-remote-desktop-{windows-x64.zip,
+linux-x86_64.tar.gz}`, checks its SHA-256 against the asset's `digest`, unpacks it in a private
+temporary folder and runs its `rd-host install --update` elevated. `--update` reuses every saved
+setting (and on Windows renames an open `rd-client.exe` out of the way before copying).
 
 ## Dynamic DNS, Wake-on-LAN, app install
 
@@ -153,18 +220,18 @@ All viewers share one agent through a **desk**:
 - **Lifetime:** the agent is stopped when the last viewer leaves.
 - **Permissions:** enforced per viewer in the daemon. Input from a view-only account is dropped before it ever reaches the agent.
 
-## Protocol (v7)
+## Protocol (v8)
 
 Messages are postcard-encoded with a `u32` length prefix.
 
 **Client to host, inside TLS:**
 
-1. `ClientHello { username, credential: Password | Pin | DeviceToken, remember_device_as, mode }`
-2. `LoginResult::Ok { user, device_token? } | Denied`
+1. `ClientHello { username, credential: Password | Pin | DeviceToken, remember_device_as, mode, device, code? }`
+2. `LoginResult::Ok { user, device_token? } | Denied | NeedCode`
 3. Then, depending on the mode:
    - `Mode::Desktop`:
-     - host → client `HostMsg::{Frame, Video, Codec, Status, Displays, Clipboard, Audio, Files, Viewers, Bye}`
-     - client → host `ClientMsg::{Input, RequestKeyframe, SelectDisplay, Clipboard, SecureAttention, SetAudio, Files, SetCodec, Disconnect}`
+     - host → client `HostMsg::{Frame, Video, Codec, Status, Displays, Clipboard, Audio, Files, Viewers, Pong, Cursor, Privacy, Chat, Bye}`
+     - client → host `ClientMsg::{Input, RequestKeyframe, SelectDisplay, Clipboard, SecureAttention, SetAudio, Files, SetCodec, Ping, LockOnLeave, Privacy, FitResolution, Chat, Gamepad, Disconnect}`
    - `Mode::Admin`: request/response `AdminRequest` / `AdminResponse`.
 
 **Other details:**

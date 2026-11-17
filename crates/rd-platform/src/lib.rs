@@ -40,10 +40,39 @@ pub trait Capturer: Send {
     fn cursor(&mut self) -> Option<CursorShape> {
         None
     }
+
+    /// Change the captured display's resolution to the largest mode that fits in
+    /// `size`, or put the original back with `None`. Returns the size now in use.
+    fn set_resolution(&mut self, _size: Option<(u32, u32)>) -> Result<(u32, u32)> {
+        anyhow::bail!("this desktop can't change its resolution remotely")
+    }
 }
 
 pub trait InputInjector: Send {
     fn inject(&mut self, ev: &InputEvent) -> Result<()>;
+
+    /// Ignore the computer's own keyboard and mouse (privacy screen); injected input
+    /// still works. Undone by `false` and when the injector is dropped.
+    fn block_local_input(&mut self, _on: bool) -> Result<()> {
+        anyhow::bail!("this desktop can't block its own keyboard and mouse")
+    }
+}
+
+/// Keeps the monitor dark (or covered) while it exists; the captured picture is unaffected.
+pub trait PrivacyScreen: Send {}
+
+/// Darken the monitor of the desktop being captured (privacy screen). On Windows a
+/// black window that screen capture leaves out; on X11 the monitor is switched off.
+pub fn privacy_screen(backend: Backend) -> Result<Box<dyn PrivacyScreen>> {
+    let backend = if backend == Backend::Auto { detect()? } else { backend };
+    match backend {
+        #[cfg(windows)]
+        Backend::Windows => windows::privacy_screen(),
+        #[cfg(target_os = "linux")]
+        Backend::X11 => linux::x11::privacy_screen(),
+        Backend::Wayland => anyhow::bail!("Wayland desktops don't allow blanking the screen remotely"),
+        other => anyhow::bail!("backend {other} is not available on this OS"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +154,8 @@ struct Tracking {
     inner: Box<dyn InputInjector>,
     keys: HashSet<u16>,
     buttons: HashSet<ButtonKey>,
+    /// Local input is blocked (privacy screen); undone on drop.
+    blocked: bool,
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
@@ -146,11 +177,17 @@ fn button_from_key(k: ButtonKey) -> MouseButton {
 
 impl Tracking {
     fn new(inner: Box<dyn InputInjector>) -> Self {
-        Self { inner, keys: HashSet::new(), buttons: HashSet::new() }
+        Self { inner, keys: HashSet::new(), buttons: HashSet::new(), blocked: false }
     }
 }
 
 impl InputInjector for Tracking {
+    fn block_local_input(&mut self, on: bool) -> Result<()> {
+        self.inner.block_local_input(on)?;
+        self.blocked = on;
+        Ok(())
+    }
+
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
         match ev {
             InputEvent::Key { code, down } => {
@@ -185,6 +222,9 @@ impl InputInjector for Tracking {
 impl Drop for Tracking {
     fn drop(&mut self) {
         let _ = self.inject(&InputEvent::ReleaseAll);
+        if self.blocked {
+            let _ = self.inner.block_local_input(false);
+        }
     }
 }
 

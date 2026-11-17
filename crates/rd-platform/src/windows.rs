@@ -60,6 +60,7 @@ pub fn open() -> Result<(Box<dyn Capturer>, Box<dyn InputInjector>)> {
             seed_pending: true,
             desktop: DesktopSync::default(),
             cursor_last: None,
+            changed_mode: None,
         }),
         Box::new(WinInjector { rect, desktop: DesktopSync::default() }),
     ))
@@ -166,6 +167,8 @@ struct WinCapturer {
     desktop: DesktopSync,
     /// Last pointer seen: (cursor handle, showing).
     cursor_last: Option<(isize, bool)>,
+    /// Display whose resolution was changed (device name), to put back.
+    changed_mode: Option<Vec<u16>>,
 }
 
 impl WinCapturer {
@@ -183,7 +186,82 @@ impl WinCapturer {
     }
 }
 
+impl Drop for WinCapturer {
+    fn drop(&mut self) {
+        if let Some(dev) = self.changed_mode.take() {
+            restore_mode(&dev);
+        }
+    }
+}
+
+/// Back to the resolution saved in the registry (the user's own setting).
+fn restore_mode(device: &[u16]) {
+    unsafe {
+        let _ = ChangeDisplaySettingsExW(windows::core::PCWSTR(device.as_ptr()), None, HWND::default(), CDS_TYPE(0), None);
+    }
+}
+
 impl Capturer for WinCapturer {
+    fn set_resolution(&mut self, size: Option<(u32, u32)>) -> Result<(u32, u32)> {
+        self.desktop.sync(true);
+        let name = self.target().name.clone();
+        let device: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let dev = windows::core::PCWSTR(device.as_ptr());
+        match size {
+            None => {
+                if let Some(d) = self.changed_mode.take() {
+                    restore_mode(&d);
+                }
+            }
+            Some((w, h)) => {
+                let mut cur = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+                unsafe { EnumDisplaySettingsW(dev, ENUM_CURRENT_SETTINGS, &mut cur) }.ok().context("read the current display mode")?;
+                // Every mode the display offers at the current colour depth.
+                let mut best: Option<DEVMODEW> = None;
+                let mut i = 0;
+                loop {
+                    let mut m = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+                    if !unsafe { EnumDisplaySettingsW(dev, ENUM_DISPLAY_SETTINGS_MODE(i), &mut m) }.as_bool() {
+                        break;
+                    }
+                    i += 1;
+                    if m.dmBitsPerPel != cur.dmBitsPerPel || m.dmPelsWidth < 800 || m.dmPelsHeight < 600 {
+                        continue;
+                    }
+                    if m.dmPelsWidth > w || m.dmPelsHeight > h {
+                        continue;
+                    }
+                    let score = |d: &DEVMODEW| {
+                        (d.dmPelsWidth as u64 * d.dmPelsHeight as u64, d.dmDisplayFrequency == cur.dmDisplayFrequency, d.dmDisplayFrequency)
+                    };
+                    if best.as_ref().is_none_or(|b| score(&m) > score(b)) {
+                        best = Some(m);
+                    }
+                }
+                let mut m = best.ok_or_else(|| anyhow!("the display has no mode that fits {w}x{h}"))?;
+                if (m.dmPelsWidth, m.dmPelsHeight) != (cur.dmPelsWidth, cur.dmPelsHeight) {
+                    m.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
+                    // Dynamic change only: the user's saved resolution is left alone.
+                    let r = unsafe { ChangeDisplaySettingsExW(dev, Some(&m), HWND::default(), CDS_TYPE(0), None) };
+                    if r != DISP_CHANGE_SUCCESSFUL {
+                        bail!("the display refused {}x{} (code {})", m.dmPelsWidth, m.dmPelsHeight, r.0);
+                    }
+                    if self.changed_mode.is_none() {
+                        self.changed_mode = Some(device.clone());
+                    }
+                }
+            }
+        }
+        // Duplication must be recreated for the new size.
+        std::thread::sleep(Duration::from_millis(300));
+        self.refresh_displays();
+        self.dxgi = None;
+        self.retry_dxgi_at = Instant::now();
+        self.seed_pending = true;
+        let t = self.target();
+        Ok((t.width, t.height))
+    }
+
     fn cursor(&mut self) -> Option<CursorShape> {
         // Same thread as capture, so it follows the input desktop (lock screen, UAC) too.
         self.desktop.sync(false);
@@ -605,6 +683,14 @@ fn key(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
 }
 
 impl InputInjector for WinInjector {
+    fn block_local_input(&mut self, on: bool) -> Result<()> {
+        // Called on the input thread, which is the one injecting: Windows lets the
+        // thread that blocked input keep sending it. Ctrl+Alt+Del always unblocks.
+        self.desktop.sync(true);
+        unsafe { BlockInput(on) }.context("BlockInput")?;
+        Ok(())
+    }
+
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
         self.desktop.sync(false);
         let input = match *ev {
@@ -625,6 +711,7 @@ impl InputInjector for WinInjector {
                 let ny = ((py - vy) as i64 * 65535 / (vh - 1) as i64) as i32;
                 mouse(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
             }
+            InputEvent::MouseRelative { dx, dy } => mouse(dx, dy, 0, MOUSEEVENTF_MOVE),
             InputEvent::MouseButton { button, down } => {
                 let (flags, data) = match (button, down) {
                     (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -680,5 +767,138 @@ fn send(inputs: &[INPUT]) {
     if n as usize != inputs.len() {
         // Typically UIPI blocking input into an elevated window when not running as SYSTEM.
         log::debug!("SendInput injected {n}/{} events", inputs.len());
+    }
+}
+
+// ------------------------------------------------------------------ privacy screen
+
+/// A black, click-through, topmost window over every monitor that Windows leaves out of
+/// screen capture (WDA_EXCLUDEFROMCAPTURE, Windows 10 2004+): the person at the computer
+/// sees black while viewers see the desktop.
+struct WinPrivacy {
+    thread_id: u32,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl crate::PrivacyScreen for WinPrivacy {}
+
+impl Drop for WinPrivacy {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, windows::Win32::Foundation::WPARAM(0), LPARAM(0));
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+const WDA_EXCLUDEFROMCAPTURE: WINDOW_DISPLAY_AFFINITY = WINDOW_DISPLAY_AFFINITY(0x11);
+
+pub fn privacy_screen() -> Result<Box<dyn crate::PrivacyScreen>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32>>();
+    let join = std::thread::Builder::new().name("privacy".into()).spawn(move || {
+        let mut desktop = DesktopSync::default();
+        desktop.sync(true);
+        match create_privacy_window() {
+            Ok(hwnd) => {
+                let _ = tx.send(Ok(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }));
+                unsafe {
+                    // Stay on top of windows that open later.
+                    SetTimer(hwnd, 1, 500, None);
+                    let mut msg = MSG::default();
+                    while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+                        if msg.message == WM_TIMER {
+                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        }
+        drop(desktop);
+    })?;
+    match rx.recv() {
+        Ok(Ok(thread_id)) => Ok(Box::new(WinPrivacy { thread_id, join: Some(join) })),
+        Ok(Err(e)) => {
+            let _ = join.join();
+            Err(e)
+        }
+        Err(_) => bail!("privacy screen thread stopped"),
+    }
+}
+
+unsafe extern "system" fn privacy_proc(hwnd: HWND, msg: u32, wp: windows::Win32::Foundation::WPARAM, lp: LPARAM) -> windows::Win32::Foundation::LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut r = RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            let black = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0));
+            FillRect(dc, &r, black);
+            let _ = DeleteObject(black);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, windows::Win32::Foundation::COLORREF(0x00909090));
+            let font = CreateFontW(36, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, windows::core::w!("Segoe UI"));
+            let old = SelectObject(dc, font);
+            // Centre the text on the primary monitor.
+            let (pw, ph) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+            let mut tr = RECT { left: -vx, top: -vy, right: -vx + pw, bottom: -vy + ph };
+            let mut text: Vec<u16> = "This computer is being used remotely".encode_utf16().collect();
+            DrawTextW(dc, &mut text, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dc, old);
+            let _ = DeleteObject(font);
+            let _ = EndPaint(hwnd, &ps);
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            SetCursor(None);
+            windows::Win32::Foundation::LRESULT(1)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+fn create_privacy_window() -> Result<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
+        let class = windows::core::w!("RdPrivacyScreen");
+        let wc = WNDCLASSW { lpfnWndProc: Some(privacy_proc), hInstance: instance.into(), lpszClassName: class, ..Default::default() };
+        RegisterClassW(&wc); // fails harmlessly if already registered
+        let (x, y, w, h) = (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        );
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            class,
+            windows::core::w!("Privacy screen"),
+            WS_POPUP,
+            x,
+            y,
+            w,
+            h,
+            HWND::default(),
+            HMENU::default(),
+            instance,
+            None,
+        )?;
+        let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
+        if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
+            let _ = DestroyWindow(hwnd);
+            bail!("this version of Windows can't hide a window from screen capture (needs Windows 10 version 2004 or newer)");
+        }
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = UpdateWindow(hwnd);
+        Ok(hwnd)
     }
 }

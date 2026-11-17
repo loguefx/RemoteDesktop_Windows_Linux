@@ -13,6 +13,22 @@ pub const BTN_MIDDLE: u16 = 0x112;
 pub const BTN_SIDE: u16 = 0x113;
 pub const BTN_EXTRA: u16 = 0x114;
 
+/// Map a set-1 scan code (with the extended flag) back to an evdev code.
+pub fn win_scancode_to_evdev(sc: u16, extended: bool) -> Option<u16> {
+    if !extended {
+        return match sc {
+            0x45 => Some(119), // Pause arrives as plain 0x45 (NumLock is extended)
+            1..=88 => Some(sc),
+            0x73 => Some(89),
+            0x7D => Some(124),
+            0x64..=0x6E => Some(183 + sc - 0x64),
+            0x76 => Some(194),
+            _ => None,
+        };
+    }
+    (1..=194).find(|&c| evdev_to_win_scancode(c) == Some((sc, true)))
+}
+
 /// Map an evdev code to a set-1 scan code. Returns `(scancode, extended)`.
 pub fn evdev_to_win_scancode(code: u16) -> Option<(u16, bool)> {
     Some(match code {

@@ -33,6 +33,7 @@ use crate::discover::{self, Found};
 use crate::setup::{self, SetupRequest};
 use crate::keymap;
 use crate::session::{self, Direction, TransferState};
+use crate::{keyhook, pads, update};
 
 // ======================================================================== app state
 
@@ -72,6 +73,9 @@ struct SignInForm {
     pin_only: bool,
     remember: bool,
     message: Option<String>,
+    /// Two-step sign-in: the code field is showing.
+    need_code: bool,
+    code: String,
 }
 
 #[derive(Clone)]
@@ -85,6 +89,8 @@ struct SetupForm {
     ddns_was: String,
     ddns_token: String,
     wake_on_lan: bool,
+    /// Ask the person at this computer before anyone connects.
+    ask_to_allow: bool,
     /// Changing the name or PIN of a computer that is already set up.
     change: bool,
     error: Option<String>,
@@ -137,6 +143,21 @@ struct SessionView {
     fullscreen: bool,
     /// Pointer is currently over the remote image (and not over a panel).
     remote_hover: bool,
+    show_chat: bool,
+    chat_input: String,
+    /// Lock the remote computer when this session ends.
+    lock_on_leave: bool,
+    /// System shortcuts (Windows key, Alt+Tab) go to the remote computer.
+    shortcuts: bool,
+    /// Fit the remote resolution to this window: on, the size last asked for, and when
+    /// the window size last changed.
+    fit: bool,
+    fit_sent: Option<(u32, u32)>,
+    view_px: (u32, u32),
+    view_changed: Instant,
+    /// Gaming mode: pointer locked in the window, relative mouse, controllers forwarded.
+    gaming: bool,
+    pads: Option<pads::Forwarder>,
 }
 
 type AdminReply = oneshot::Receiver<Result<AdminResponse, String>>;
@@ -144,6 +165,10 @@ type AdminReply = oneshot::Receiver<Result<AdminResponse, String>>;
 enum Purpose {
     Users,
     Devices,
+    /// Our own account (after two-step sign-in changes).
+    Me,
+    /// A new two-step secret to show.
+    Totp,
     /// A change; on success show the message and refresh lists.
     Change(String),
 }
@@ -160,6 +185,9 @@ struct AdminView {
     reset: Option<(String, String)>,
     message: Option<(bool, String)>,
     pending: Vec<(Purpose, AdminReply)>,
+    /// Setting up two-step sign-in: (secret, otpauth link), and the code typed.
+    totp: Option<(String, String)>,
+    totp_code: String,
 }
 
 impl AdminView {
@@ -174,6 +202,7 @@ impl AdminView {
             self.request(AdminRequest::ListUsers, Purpose::Users);
         }
         self.request(AdminRequest::ListDevices, Purpose::Devices);
+        self.request(AdminRequest::WhoAmI, Purpose::Me);
     }
 }
 
@@ -194,34 +223,20 @@ pub struct Gui {
     pending_fullscreen: Option<bool>,
     /// "Rename on this device": (computer key, text being edited).
     rename: Option<(String, String)>,
-    /// A newer release: (version, download page).
-    update: Arc<std::sync::Mutex<Option<(String, String)>>>,
-}
-
-/// Where new versions are published.
-const RELEASES_API: &str = "https://api.github.com/repos/loguefx/RemoteDesktop_Windows_Linux/releases/latest";
-
-/// `1.2.10` > `1.2.9`; non-numeric parts count as 0.
-fn newer(candidate: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).take(3).map(|p| p.parse().unwrap_or(0)).collect() };
-    parse(candidate) > parse(current)
+    /// A newer release.
+    update: Arc<std::sync::Mutex<Option<update::Release>>>,
+    /// Modifier keys held (for Ctrl+Alt+G, which leaves gaming mode).
+    mods: winit::keyboard::ModifiersState,
 }
 
 /// Ask GitHub for the latest release once per start (set RD_NO_UPDATE_CHECK=1 to skip).
-fn check_for_update(rt: &tokio::runtime::Handle, ctx: egui::Context, out: Arc<std::sync::Mutex<Option<(String, String)>>>) {
+fn check_for_update(rt: &tokio::runtime::Handle, ctx: egui::Context, out: Arc<std::sync::Mutex<Option<update::Release>>>) {
     if std::env::var_os("RD_NO_UPDATE_CHECK").is_some() {
         return;
     }
     rt.spawn(async move {
-        let r = rd_core::http::get(RELEASES_API, &[("Accept", "application/vnd.github+json")]).await;
-        let Ok(r) = r else { return };
-        if r.status != 200 {
-            return; // no release yet, or the repository is private
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body) else { return };
-        let (Some(tag), Some(url)) = (v["tag_name"].as_str(), v["html_url"].as_str()) else { return };
-        if newer(tag, env!("CARGO_PKG_VERSION")) && url.starts_with("https://github.com/") {
-            *out.lock().unwrap() = Some((tag.trim_start_matches('v').to_string(), url.to_string()));
+        if let Ok(Some(r)) = update::check().await {
+            *out.lock().unwrap() = Some(r);
             ctx.request_repaint();
         }
     });
@@ -243,6 +258,7 @@ impl Gui {
             pending_fullscreen: None,
             rename: None,
             update: Arc::default(),
+            mods: Default::default(),
         };
         check_for_update(&g.rt, g.ctx.clone(), g.update.clone());
         if let Some(t) = autoconnect {
@@ -308,6 +324,29 @@ impl Gui {
                     pin_only: computer,
                     remember: true,
                     message,
+                    need_code: false,
+                    code: String::new(),
+                });
+            }
+            Ok(Outcome::NeedCode) => {
+                // Same sign-in again, now with the authenticator app's code.
+                let (username, secret, use_pin, had_code) = match &attempt.creds {
+                    Creds::Password { username, password, code } => (username.clone(), password.clone(), false, code.is_some()),
+                    Creds::Pin { username, pin, code } => (username.clone(), pin.clone(), true, code.is_some()),
+                    Creds::Saved(u) => (u.clone().unwrap_or_default(), String::new(), false, false),
+                };
+                let pin_only = use_pin && username.is_empty();
+                self.screen = Screen::SignIn(SignInForm {
+                    target: attempt.target,
+                    mode: attempt.mode,
+                    username,
+                    secret,
+                    use_pin,
+                    pin_only,
+                    remember: attempt.remember,
+                    message: had_code.then(|| "Enter the code from your authenticator app.".to_string()),
+                    need_code: true,
+                    code: String::new(),
                 });
             }
             Ok(Outcome::Denied(why)) => {
@@ -317,6 +356,12 @@ impl Gui {
                     Creds::Saved(u) => (u.clone().unwrap_or_default(), false),
                 };
                 let pin_only = use_pin && matches!(attempt.target, Dest::Computer(_));
+                let had_code = matches!(&attempt.creds, Creds::Pin { code: Some(_), .. } | Creds::Password { code: Some(_), .. });
+                let why = if had_code && why == "invalid username or credentials" {
+                    "The PIN, password or code is wrong. Use the newest code from your app.".to_string()
+                } else {
+                    why
+                };
                 self.screen = Screen::SignIn(SignInForm {
                     target: attempt.target,
                     mode: attempt.mode,
@@ -326,6 +371,8 @@ impl Gui {
                     pin_only,
                     remember: attempt.remember,
                     message: Some(why),
+                    need_code: had_code,
+                    code: String::new(),
                 });
             }
             Ok(Outcome::Ok(s)) => match attempt.mode {
@@ -336,10 +383,14 @@ impl Gui {
                         format!("{} @ {} · {}", s.user.username, s.host_name, s.route)
                     };
                     let user = s.user.clone();
+                    let s_control = user.effective().control;
                     let route = s.route.clone();
                     let ctx = self.ctx.clone();
                     let handle = session::Handle::start(&self.rt, s, move || ctx.request_repaint());
-                    handle.send(ClientMsg::SetCodec(Store::load().video_codec()));
+                    let store = Store::load();
+                    handle.send(ClientMsg::SetCodec(store.video_codec()));
+                    let lock_on_leave = store.lock_on_leave.unwrap_or(true);
+                    handle.send(ClientMsg::LockOnLeave(lock_on_leave));
                     self.screen = Screen::Session(Box::new(SessionView {
                         handle,
                         dest: attempt.target.clone(),
@@ -357,6 +408,16 @@ impl Gui {
                         path_input: String::new(),
                         fullscreen: false,
                         remote_hover: false,
+                        show_chat: false,
+                        chat_input: String::new(),
+                        lock_on_leave,
+                        shortcuts: store.system_shortcuts && s_control,
+                        fit: false,
+                        fit_sent: None,
+                        view_px: (0, 0),
+                        view_changed: Instant::now(),
+                        gaming: false,
+                        pads: None,
                     }));
                 }
                 Mode::Admin => {
@@ -390,6 +451,8 @@ impl Gui {
                         reset: None,
                         message: None,
                         pending: vec![],
+                        totp: None,
+                        totp_code: String::new(),
                     };
                     view.refresh();
                     self.screen = Screen::Admin(Box::new(view));
@@ -507,6 +570,30 @@ impl Gui {
             return false;
         }
         let control = v.user.effective().control;
+        if let WindowEvent::ModifiersChanged(m) = event {
+            self.mods = m.state();
+        }
+        // Ctrl+Alt+G leaves gaming mode (the pointer is locked in the window).
+        if let WindowEvent::KeyboardInput { event: k, .. } = event {
+            if v.gaming
+                && k.state == ElementState::Pressed
+                && k.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::KeyG)
+                && self.mods.control_key()
+                && self.mods.alt_key()
+            {
+                v.gaming = false;
+                v.pads = None;
+                return true;
+            }
+        }
+        if v.gaming {
+            // Relative motion comes from raw device events (App::device_event).
+            if matches!(event, WindowEvent::CursorMoved { .. }) {
+                return true;
+            }
+            v.remote_hover = true;
+            v.remote_focus = true;
+        }
         let to_remote = |v: &SessionView, x: f64, y: f64| -> Option<(u32, u32)> {
             let r = v.image_rect?;
             let p = egui::pos2(x as f32 / ppp, y as f32 / ppp);
@@ -620,13 +707,28 @@ impl Gui {
             }
         }
         if matches!(self.screen, Screen::Home) {
-            if let Some((version, url)) = self.update.lock().unwrap().clone() {
+            let release = self.update.lock().unwrap().clone();
+            if let Some(r) = release {
+                let mut go = false;
                 egui::TopBottomPanel::top("update").show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("Version {version} is available."));
-                        ui.hyperlink_to("Download", url);
+                        ui.label(format!("Version {} is available.", r.version));
+                        if r.asset.is_some() {
+                            go = ui.button("Update now").on_hover_text("Downloads it, checks it, and updates the app and this computer's service").clicked();
+                        }
+                        ui.hyperlink_to("Release notes", &r.page);
                     });
                 });
+                if go {
+                    let rt = self.rt.clone();
+                    let busy = if cfg!(windows) {
+                        "Updating... approve the Windows administrator prompt."
+                    } else {
+                        "Updating... enter your password when asked."
+                    };
+                    *self.update.lock().unwrap() = None;
+                    self.run_admin_task(busy, None, move || update::install(&rt, &r));
+                }
             }
         }
         let mut next: Option<Screen> = None;
@@ -725,6 +827,7 @@ impl Gui {
                     ddns,
                     ddns_off,
                     wake_on_lan: form.wake_on_lan,
+                    ask_to_allow: form.ask_to_allow,
                 };
                 let mut back = form.clone();
                 back.pin.clear();
@@ -978,6 +1081,7 @@ fn home_ui(
                                 ddns_was: ddns,
                                 ddns_token: String::new(),
                                 wake_on_lan: true,
+                                ask_to_allow: f.announce.ask_to_allow,
                                 internet: f.announce.public_note.as_deref() != Some("access from the internet is turned off"),
                                 change: true,
                                 error: None,
@@ -1005,6 +1109,7 @@ fn home_ui(
                             ddns_was: String::new(),
                             ddns_token: String::new(),
                             wake_on_lan: true,
+                            ask_to_allow: false,
                             internet: true,
                             change: false,
                             error: None,
@@ -1294,6 +1399,12 @@ fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
                     });
             }
             ui.checkbox(&mut f.wake_on_lan, "Let my other devices wake this computer from sleep (Wake-on-LAN)");
+            ui.checkbox(&mut f.ask_to_allow, "Ask me before anyone connects");
+            ui.label(
+                RichText::new("Someone at this computer must click Allow first. Leave this off to connect to it while you're away.")
+                    .small()
+                    .color(grey),
+            );
             ui.add_space(6.0);
             ui.label(
                 RichText::new("After 5 wrong PINs, sign-in pauses for a while; after 10 the PIN is switched off until you set it again here.")
@@ -1323,7 +1434,15 @@ fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
         });
     });
     if out == Some(true) {
-        let req = SetupRequest { name: f.name.trim().to_string(), pin: f.pin.clone(), internet: f.internet, ddns: None, ddns_off: false, wake_on_lan: false };
+        let req = SetupRequest {
+            name: f.name.trim().to_string(),
+            pin: f.pin.clone(),
+            internet: f.internet,
+            ddns: None,
+            ddns_off: false,
+            wake_on_lan: false,
+            ask_to_allow: false,
+        };
         if let Err(e) = setup::validate(&req) {
             f.error = Some(e);
             return None;
@@ -1394,6 +1513,19 @@ fn sign_in_ui(ctx: &egui::Context, f: &mut SignInForm) -> Option<Option<Attempt>
                     out = Some(true);
                 }
                 ui.end_row();
+                if f.need_code {
+                    ui.label("Code");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut f.code).hint_text("from your authenticator app").desired_width(260.0).char_limit(7),
+                    );
+                    if f.code.is_empty() && !f.secret.is_empty() {
+                        focus_if_free(ui, &r);
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        out = Some(true);
+                    }
+                    ui.end_row();
+                }
             });
             ui.add_space(4.0);
             if !f.pin_only {
@@ -1427,7 +1559,8 @@ fn sign_in_ui(ctx: &egui::Context, f: &mut SignInForm) -> Option<Option<Attempt>
         Some(true) if (f.pin_only || !f.username.trim().is_empty()) && !f.secret.is_empty() => {
             let username = if f.pin_only { String::new() } else { f.username.trim().to_string() };
             let secret = std::mem::take(&mut f.secret);
-            let creds = if f.use_pin { Creds::Pin { username, pin: secret } } else { Creds::Password { username, password: secret } };
+            let code = (f.need_code && !f.code.trim().is_empty()).then(|| f.code.trim().to_string());
+            let creds = if f.use_pin { Creds::Pin { username, pin: secret, code } } else { Creds::Password { username, password: secret, code } };
             Some(Some(Attempt { target: f.target.clone(), mode: f.mode, creds, remember: f.remember }))
         }
         Some(false) => Some(None),
@@ -1529,8 +1662,59 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
     if v.show_files && !v.fullscreen {
         files_panel(ctx, v);
     }
+    if v.show_chat {
+        chat_panel(ctx, v);
+    }
     session_picture(ctx, v, &status);
+    // Fit the remote resolution once the window has stopped changing size.
+    if v.fit && v.view_px.0 > 0 && v.view_changed.elapsed() > Duration::from_millis(700) && v.fit_sent != Some(v.view_px) {
+        v.fit_sent = Some(v.view_px);
+        v.handle.send(ClientMsg::FitResolution(Some(v.view_px)));
+    }
+    if v.fit && v.fit_sent != Some(v.view_px) {
+        ctx.request_repaint_after(Duration::from_millis(300));
+    }
     action
+}
+
+fn chat_panel(ctx: &egui::Context, v: &mut SessionView) {
+    egui::SidePanel::right("chat").default_width(300.0).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.heading("Chat");
+            if ui.small_button("Close").clicked() {
+                v.show_chat = false;
+            }
+        });
+        ui.label(RichText::new("With the person at the remote computer and anyone else connected.").small().color(Color32::GRAY));
+        ui.separator();
+        let lines = {
+            let mut s = v.handle.state.lock().unwrap();
+            s.chat_unread = 0;
+            s.chat.clone()
+        };
+        egui::ScrollArea::vertical().max_height(ui.available_height() - 40.0).stick_to_bottom(true).show(ui, |ui| {
+            if lines.is_empty() {
+                ui.label(RichText::new("No messages yet.").color(Color32::GRAY));
+            }
+            for (from, text) in &lines {
+                ui.label(RichText::new(from).small().color(Color32::GRAY));
+                ui.label(text);
+                ui.add_space(4.0);
+            }
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut v.chat_input).hint_text("Message").desired_width(ui.available_width() - 60.0));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || enter) && !v.chat_input.trim().is_empty() {
+                let text: String = v.chat_input.trim().chars().take(rd_core::proto::MAX_CHAT).collect();
+                v.chat_input.clear();
+                v.handle.state.lock().unwrap().chat.push(("You".into(), text.clone()));
+                v.handle.send(ClientMsg::Chat(text));
+                r.request_focus();
+            }
+        });
+    });
 }
 
 /// "Direct · this network · 12 ms · 30 fps", with a coloured dot.
@@ -1624,6 +1808,12 @@ fn toolbar(
                         v.handle.list_dir("");
                     }
                 }
+                let unread = v.handle.state.lock().unwrap().chat_unread;
+                let chat_label = if unread > 0 && !v.show_chat { format!("Chat ({unread})") } else { "Chat".to_string() };
+                if ui.selectable_label(v.show_chat, chat_label).clicked() {
+                    v.show_chat = !v.show_chat;
+                }
+                ui.menu_button("More", |ui| more_menu(ui, v));
                 if v.fullscreen {
                     if ui.button("Leave full screen").on_hover_text("Or press F11").clicked() {
                         action = Some(SessionAction::Fullscreen(false));
@@ -1641,6 +1831,65 @@ fn toolbar(
                 }
     });
     action
+}
+
+/// Session options: lock on leave, privacy screen, shortcuts, fit, gaming mode.
+fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
+    let control = v.user.effective().control;
+    let (privacy, note) = {
+        let s = v.handle.state.lock().unwrap();
+        (s.privacy, s.privacy_note.clone())
+    };
+    if ui.checkbox(&mut v.lock_on_leave, "Lock the computer when I disconnect").changed() {
+        v.handle.send(ClientMsg::LockOnLeave(v.lock_on_leave));
+        let mut store = Store::load();
+        store.lock_on_leave = Some(v.lock_on_leave);
+        let _ = store.save();
+    }
+    if !control {
+        ui.label(RichText::new("The other options need control of the computer.").small().color(Color32::GRAY));
+        return;
+    }
+    let mut p = privacy;
+    if ui
+        .checkbox(&mut p, "Privacy screen")
+        .on_hover_text("Black out the remote monitor and ignore its keyboard and mouse while you're connected")
+        .changed()
+    {
+        v.handle.send(ClientMsg::Privacy(p));
+    }
+    if let Some(n) = note {
+        ui.label(RichText::new(n).small().color(Color32::from_rgb(220, 150, 60)));
+    }
+    if ui
+        .checkbox(&mut v.shortcuts, "Send system shortcuts")
+        .on_hover_text("The Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote computer instead of this one")
+        .changed()
+    {
+        let mut store = Store::load();
+        store.system_shortcuts = v.shortcuts;
+        let _ = store.save();
+    }
+    if ui
+        .checkbox(&mut v.fit, "Fit its resolution to this window")
+        .on_hover_text("Switch the remote screen to the resolution closest to this window, for sharp text; it's put back when you disconnect")
+        .changed()
+    {
+        v.fit_sent = None;
+        v.view_changed = Instant::now() - Duration::from_secs(1);
+        if !v.fit {
+            v.handle.send(ClientMsg::FitResolution(None));
+        }
+    }
+    let was = v.gaming;
+    ui.checkbox(&mut v.gaming, "Gaming mode")
+        .on_hover_text("Locks the pointer in the window and sends raw mouse movement and game controllers. Press Ctrl+Alt+G to leave.");
+    if v.gaming != was {
+        v.pads = v.gaming.then(|| pads::start(v.handle.sender()));
+        if v.gaming {
+            ui.close_menu();
+        }
+    }
 }
 
 /// The remote picture, filling the rest of the window.
@@ -1676,6 +1925,12 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
 
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(24))).show(ctx, |ui| {
         let avail = ui.available_rect_before_wrap();
+        let ppp = ctx.pixels_per_point();
+        let px = ((avail.width() * ppp) as u32, (avail.height() * ppp) as u32);
+        if px != v.view_px {
+            v.view_px = px;
+            v.view_changed = Instant::now();
+        }
         match &v.texture {
             Some(tex) if v.remote_size.0 > 0 => {
                 let (rw, rh) = (v.remote_size.0 as f32, v.remote_size.1 as f32);
@@ -1808,6 +2063,11 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
         match (purpose, r) {
             (Purpose::Users, Ok(AdminResponse::Users(u))) => v.users = u,
             (Purpose::Devices, Ok(AdminResponse::Devices(d))) => v.devices = d,
+            (Purpose::Me, Ok(AdminResponse::User(u))) => v.me = u,
+            (Purpose::Totp, Ok(AdminResponse::Totp { secret, uri })) => {
+                v.totp = Some((secret, uri));
+                v.totp_code.clear();
+            }
             (Purpose::Change(msg), Ok(AdminResponse::Ok)) => {
                 v.message = Some((true, msg));
                 refresh = true;
@@ -1842,8 +2102,8 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
             if is_admin {
                 ui.heading("Users");
                 let mut actions: Vec<(AdminRequest, String)> = Vec::new();
-                egui::Grid::new("users").striped(true).num_columns(8).show(ui, |ui| {
-                    for h in ["User", "Role", "View", "Control", "Clipboard", "Files", "PIN", ""] {
+                egui::Grid::new("users").striped(true).num_columns(9).show(ui, |ui| {
+                    for h in ["User", "Role", "View", "Control", "Clipboard", "Files", "PIN", "2-step", ""] {
                         ui.label(RichText::new(h).strong());
                     }
                     ui.end_row();
@@ -1875,6 +2135,15 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
                             ));
                         }
                         ui.label(if u.has_pin { "yes" } else { "no" });
+                        ui.horizontal(|ui| {
+                            ui.label(if u.has_totp { "on" } else { "off" });
+                            if u.has_totp && u.username != v.me.username && ui.small_button("Turn off").clicked() {
+                                actions.push((
+                                    AdminRequest::TotpDisable { username: u.username.clone() },
+                                    format!("two-step sign-in turned off for {}", u.username),
+                                ));
+                            }
+                        });
                         ui.horizontal(|ui| {
                             let label = if u.disabled { "Enable" } else { "Disable" };
                             if ui.small_button(label).clicked() {
@@ -1977,6 +2246,7 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
                     v.request(AdminRequest::SetPin { username, pin: None }, Purpose::Change("PIN removed".into()));
                 }
             });
+            two_step_ui(ui, v);
             ui.separator();
             ui.heading(if is_admin { "Remembered devices (all users)" } else { "My remembered devices" });
             let mut revoke = None;
@@ -2004,14 +2274,77 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
     leave
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn version_compare() {
-        assert!(super::newer("v0.2.0", "0.1.0"));
-        assert!(super::newer("0.1.10", "0.1.9"));
-        assert!(!super::newer("v0.1.0", "0.1.0"));
-        assert!(!super::newer("0.0.9", "0.1.0"));
+/// "Two-step sign-in" in My account: turn it on (QR code, then a code to confirm) or off.
+fn two_step_ui(ui: &mut egui::Ui, v: &mut AdminView) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("Two-step sign-in").strong());
+    let grey = Color32::GRAY;
+    if v.me.has_totp {
+        ui.horizontal(|ui| {
+            ui.label("On: signing in also needs a code from your authenticator app (remembered devices don't).");
+            if ui.button("Turn off").clicked() {
+                let username = v.me.username.clone();
+                v.request(AdminRequest::TotpDisable { username }, Purpose::Change("two-step sign-in turned off".into()));
+            }
+        });
+        return;
+    }
+    match v.totp.clone() {
+        None => {
+            ui.horizontal(|ui| {
+                ui.label("Off. Turn it on to also ask for a code from an app like Google Authenticator or Microsoft Authenticator.");
+                if ui.button("Turn on").clicked() {
+                    v.request(AdminRequest::TotpSetup, Purpose::Totp);
+                }
+            });
+        }
+        Some((secret, uri)) => {
+            ui.label("1. Scan this with your authenticator app (or type the key below):");
+            qr_code(ui, &uri, 4.0);
+            ui.label(RichText::new(group(&secret)).monospace());
+            ui.label(RichText::new("Keep this key private: anyone with it can make codes.").small().color(grey));
+            ui.horizontal(|ui| {
+                ui.label("2. Enter the code it shows:");
+                let r = ui.add(egui::TextEdit::singleline(&mut v.totp_code).desired_width(90.0).char_limit(7));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Turn on").clicked() || enter {
+                    let code = v.totp_code.trim().to_string();
+                    v.totp = None;
+                    v.request(AdminRequest::TotpEnable { code }, Purpose::Change("two-step sign-in is on".into()));
+                }
+                if ui.button("Cancel").clicked() {
+                    v.totp = None;
+                }
+            });
+        }
+    }
+}
+
+/// "ABCD EFGH ..." for reading a key aloud or typing it.
+fn group(s: &str) -> String {
+    s.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(" ")
+}
+
+/// Draw `text` as a QR code, `module` points per square.
+fn qr_code(ui: &mut egui::Ui, text: &str, module: f32) {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+        ui.label("(couldn't make a QR code; type the key instead)");
+        return;
+    };
+    let n = code.width();
+    let quiet = 4.0;
+    let side = (n as f32 + 2.0 * quiet) * module;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, Color32::WHITE);
+    let colors = code.to_colors();
+    for y in 0..n {
+        for x in 0..n {
+            if colors[y * n + x] == qrcode::Color::Dark {
+                let min = rect.min + egui::vec2((x as f32 + quiet) * module, (y as f32 + quiet) * module);
+                p.rect_filled(egui::Rect::from_min_size(min, egui::vec2(module, module)), 0.0, Color32::BLACK);
+            }
+        }
     }
 }
 
@@ -2123,9 +2456,52 @@ struct App {
     remote_cursor: Option<((u64, u32), winit::window::CustomCursor)>,
     /// The pointer is currently overridden (remote shape or hidden).
     cursor_overridden: bool,
+    /// The window has keyboard focus.
+    focused: bool,
+    /// Gaming mode's pointer lock and system-shortcut capture as last applied.
+    grabbed: bool,
+    shortcuts_on: bool,
+    /// Sub-pixel remainder of raw mouse motion.
+    motion_rest: (f64, f64),
 }
 
 impl App {
+    /// Pointer lock (gaming mode) and system-shortcut capture follow the session
+    /// options and window focus.
+    fn apply_grabs(&mut self) {
+        let (Some(gw), Some(Content::Main(gui))) = (self.gl_window.as_ref(), self.content.as_mut()) else { return };
+        let (gaming, shortcuts, sender) = match &gui.screen {
+            Screen::Session(v) if v.handle.state.lock().unwrap().closed.is_none() => {
+                (v.gaming && self.focused, v.shortcuts && self.focused, Some(v.handle.sender()))
+            }
+            _ => (false, false, None),
+        };
+        if gaming != self.grabbed {
+            self.grabbed = gaming;
+            if gaming {
+                use winit::window::CursorGrabMode;
+                if gw.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                    let _ = gw.window.set_cursor_grab(CursorGrabMode::Confined);
+                }
+                gw.window.set_cursor_visible(false);
+            } else {
+                let _ = gw.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                gw.window.set_cursor_visible(true);
+                self.cursor_overridden = true; // let the pointer logic restore its shape
+            }
+        }
+        if shortcuts != self.shortcuts_on {
+            self.shortcuts_on = shortcuts;
+            let window = keyhook::native_window(&gw.window);
+            if let Err(e) = keyhook::set(window, if shortcuts { sender } else { None }) {
+                if let Screen::Session(v) = &mut gui.screen {
+                    v.shortcuts = false;
+                    v.handle.state.lock().unwrap().status = format!("System shortcuts: {e}");
+                }
+                self.shortcuts_on = false;
+            }
+        }
+    }
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let (Some(gw), Some(eg), Some(content)) = (self.gl_window.as_mut(), self.egui_glow.as_mut(), self.content.as_mut()) else {
             return;
@@ -2136,7 +2512,9 @@ impl App {
                 gw.window.set_fullscreen(fs.then_some(winit::window::Fullscreen::Borderless(None)));
             }
             // After egui has set its own pointer: over the picture, show the remote one.
-            match gui.wanted_cursor() {
+            // (Gaming mode keeps it hidden and locked.)
+            let wanted = if self.grabbed { WantedCursor::Hidden } else { gui.wanted_cursor() };
+            match wanted {
                 WantedCursor::Os => {
                     if self.cursor_overridden {
                         self.cursor_overridden = false;
@@ -2178,6 +2556,7 @@ impl App {
         gw.swap();
         gw.window.set_visible(true);
         let _ = event_loop;
+        self.apply_grabs();
     }
 }
 
@@ -2254,6 +2633,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     gw.resize(*size);
                 }
             }
+            WindowEvent::Focused(f) => {
+                self.focused = *f;
+                self.apply_grabs();
+            }
             _ => {}
         }
         let (Some(gw), Some(eg)) = (self.gl_window.as_ref(), self.egui_glow.as_mut()) else { return };
@@ -2267,6 +2650,22 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let r = eg.on_window_event(&gw.window, &event);
         if r.repaint {
             gw.window.request_redraw();
+        }
+    }
+
+    fn device_event(&mut self, _: &winit::event_loop::ActiveEventLoop, _: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        // Gaming mode: raw mouse movement, as relative motion.
+        let winit::event::DeviceEvent::MouseMotion { delta } = event else { return };
+        if !self.grabbed {
+            return;
+        }
+        let Some(Content::Main(gui)) = self.content.as_ref() else { return };
+        let Screen::Session(v) = &gui.screen else { return };
+        let (x, y) = (delta.0 + self.motion_rest.0, delta.1 + self.motion_rest.1);
+        let (dx, dy) = (x.trunc() as i32, y.trunc() as i32);
+        self.motion_rest = (x - dx as f64, y - dy as f64);
+        if dx != 0 || dy != 0 {
+            v.handle.send(ClientMsg::Input(InputEvent::MouseRelative { dx, dy }));
         }
     }
 
@@ -2317,8 +2716,8 @@ pub fn run(rt: tokio::runtime::Runtime, autoconnect: Option<String>) -> Result<(
 pub fn run_notice(rt: tokio::runtime::Runtime, connect: &str) -> Result<()> {
     let notice = crate::notice::Notice::connect(connect)?;
     let attrs = winit::window::WindowAttributes::default()
-        .with_resizable(false)
-        .with_inner_size(winit::dpi::LogicalSize { width: 380.0, height: 150.0 })
+        .with_resizable(true)
+        .with_inner_size(winit::dpi::LogicalSize { width: 400.0, height: 360.0 })
         .with_title("RD Remote Desktop - screen shared")
         .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
         .with_enabled_buttons(winit::window::WindowButtons::MINIMIZE)
@@ -2341,6 +2740,10 @@ fn run_window(rt: tokio::runtime::Runtime, attrs: winit::window::WindowAttribute
         title: String::new(),
         remote_cursor: None,
         cursor_overridden: false,
+        focused: true,
+        grabbed: false,
+        shortcuts_on: false,
+        motion_rest: (0.0, 0.0),
     };
     {
         // The file dialogs (xdg-desktop-portal on Linux) need a tokio context on this

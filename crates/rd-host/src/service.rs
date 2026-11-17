@@ -49,6 +49,50 @@ pub struct InstallOptions {
     pub wake_on_lan: bool,
     /// Install the app next to the service, with a menu entry.
     pub app: bool,
+    /// Ask the person at the computer before anyone connects (None = unchanged).
+    pub ask_to_allow: Option<bool>,
+    /// Browser viewer on the same port (None = unchanged).
+    pub web: Option<bool>,
+    /// Updating: keep every saved setting as it is.
+    pub keep_settings: bool,
+}
+
+/// Replace the installed service (and app) with this program's version, keeping all
+/// settings, accounts and the certificate (the app's "Update" button runs this).
+pub fn update(data_dir: PathBuf, app: bool) -> Result<()> {
+    let db = Db::open(&data_dir)?;
+    if db.user_count()? == 0 {
+        anyhow::bail!("remote access isn't set up on this computer yet");
+    }
+    let get = |k: &str| db.setting(k).ok().flatten();
+    let opts = InstallOptions {
+        port: get("port").and_then(|v| v.parse().ok()).unwrap_or(rd_core::DEFAULT_PORT),
+        bind: get("bind").unwrap_or_else(|| "0.0.0.0".into()),
+        backend: get("backend").unwrap_or_else(|| "auto".into()),
+        fps: get("fps").and_then(|v| v.parse().ok()).unwrap_or(30),
+        firewall: get("listen").as_deref() != Some("off"),
+        udp_firewall: true,
+        admin_user: None,
+        relay: None,
+        relay_only: false,
+        max_viewers: get("max_viewers").and_then(|v| v.parse().ok()).unwrap_or(4),
+        video_kbps: get("video_kbps").and_then(|v| v.parse().ok()).unwrap_or(8000),
+        video_encoder: get("video_encoder").unwrap_or_else(|| "auto".into()),
+        name: None,
+        owner: None,
+        pin: None,
+        upnp: get("upnp").as_deref() == Some("on"),
+        ddns: None,
+        ddns_off: false,
+        wake_on_lan: false,
+        app,
+        ask_to_allow: None,
+        web: None,
+        keep_settings: true,
+        data_dir,
+    };
+    drop(db);
+    install(opts)
 }
 
 /// rd-client next to this program, if it's there.
@@ -62,6 +106,16 @@ fn prepare_data(opts: &InstallOptions) -> Result<String> {
     std::fs::create_dir_all(&opts.data_dir)?;
     restrict_dir(&opts.data_dir)?;
     let mut db = Db::open(&opts.data_dir)?;
+    if let Some(on) = opts.ask_to_allow {
+        db.set_setting("ask_to_allow", if on { "on" } else { "off" })?;
+    }
+    if let Some(on) = opts.web {
+        db.set_setting("web", if on { "on" } else { "off" })?;
+    }
+    if opts.keep_settings {
+        rd_core::tls::ensure_host_cert(&opts.data_dir, &crate::paths::host_name())?;
+        return rd_core::tls::host_fingerprint(&opts.data_dir);
+    }
     db.set_setting("port", &opts.port.to_string())?;
     db.set_setting("bind", &opts.bind)?;
     db.set_setting("backend", &opts.backend)?;
@@ -343,6 +397,12 @@ mod win {
         let Some(src) = app_beside_me() else { return };
         let dst = dir.join("rd-client.exe");
         if !same_file(&src, &dst) {
+            // An open app can't be overwritten, but it can be renamed out of the way.
+            if std::fs::copy(&src, &dst).is_err() && dst.exists() {
+                let old = dir.join("rd-client.old.exe");
+                let _ = std::fs::remove_file(&old);
+                let _ = std::fs::rename(&dst, &old);
+            }
             if let Err(e) = std::fs::copy(&src, &dst) {
                 println!("note: couldn't copy the app to {} ({e}); close it there and set up again to update it", dst.display());
                 if !dst.exists() {

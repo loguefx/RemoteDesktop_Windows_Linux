@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="color-scheme" content="dark light">
+<title>RD Remote Desktop</title>
+<style>
+:root {
+  --bg: #16181c; --panel: #23262c; --line: #33373f; --text: #e8e9ec; --muted: #9aa0aa;
+  --accent: #4f8cff; --accent-text: #fff; --danger: #d0503f; --ok: #5aaa5a;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f3f4f6; --panel: #fff; --line: #d9dce1; --text: #1d2026; --muted: #5f6672; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button, input, select { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+input[type=text], input[type=password], input[inputmode] { width: 100%; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg); }
+.hidden { display: none !important; }
+#login { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.card { width: 100%; max-width: 360px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 24px; }
+.card h1 { font-size: 20px; margin: 0 0 4px; }
+.card p { color: var(--muted); margin: 0 0 16px; }
+.card label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 13px; }
+.card .row { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
+.card .link { background: none; border: 0; padding: 0; color: var(--accent); }
+.err { color: var(--danger); margin-top: 10px; min-height: 1.2em; }
+#session { position: fixed; inset: 0; display: flex; flex-direction: column; }
+#bar { display: flex; gap: 6px; align-items: center; padding: 6px 8px; background: var(--panel);
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+#bar .title { font-weight: 600; margin-right: 6px; }
+#bar .status { color: var(--muted); font-size: 13px; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw; }
+#bar button, #bar select { padding: 4px 10px; font-size: 13px; }
+#stage { position: relative; flex: 1; overflow: hidden; background: #111; touch-action: none; }
+#screen { position: absolute; image-rendering: auto; outline: none; }
+#wait { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #aaa; }
+#chat { position: absolute; right: 8px; bottom: 8px; width: min(340px, calc(100% - 16px)); max-height: 60%;
+  display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+#chatlog { flex: 1; overflow-y: auto; padding: 8px 10px; font-size: 14px; }
+#chatlog .from { color: var(--muted); font-size: 12px; }
+#chatform { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
+#kbd { position: absolute; left: -1000px; top: 0; width: 10px; height: 10px; opacity: 0; }
+.badge { background: var(--accent); color: #fff; border-radius: 10px; padding: 0 6px; font-size: 11px; margin-left: 4px; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form class="card" id="loginform" autocomplete="off">
+    <h1>Remote desktop</h1>
+    <p id="loginhint">Enter this computer's PIN to connect.</p>
+    <div id="userrow" class="hidden">
+      <label for="user">Username</label>
+      <input type="text" id="user" autocapitalize="off" spellcheck="false">
+    </div>
+    <label for="secret" id="secretlabel">PIN</label>
+    <input type="password" id="secret" inputmode="numeric">
+    <div id="coderow" class="hidden">
+      <label for="code">Code from your authenticator app</label>
+      <input type="text" id="code" inputmode="numeric" maxlength="7">
+    </div>
+    <div class="err" id="loginerr"></div>
+    <div class="row">
+      <button class="primary" type="submit" id="go">Connect</button>
+      <button class="link" type="button" id="swap">Use a username and password</button>
+    </div>
+  </form>
+</div>
+
+<div id="session" class="hidden">
+  <div id="bar">
+    <span class="title" id="title"></span>
+    <select id="codec" title="Picture quality">
+      <option value="sharp">Sharp</option>
+      <option value="smooth">Smooth</option>
+    </select>
+    <select id="display" class="hidden" title="Display"></select>
+    <button id="cad" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+    <button id="keys" title="Show the on-screen keyboard">Keyboard</button>
+    <button id="privacy" title="Black out the remote monitor and block its keyboard and mouse">Privacy</button>
+    <button id="chatbtn">Chat<span id="unread" class="badge hidden"></span></button>
+    <button id="full">Full screen</button>
+    <button class="danger" id="leave">Disconnect</button>
+    <span class="status" id="status"></span>
+  </div>
+  <div id="stage">
+    <canvas id="screen" tabindex="0"></canvas>
+    <div id="wait">Connecting...</div>
+    <div id="chat" class="hidden">
+      <div id="chatlog"></div>
+      <form id="chatform"><input type="text" id="chatin" placeholder="Message" maxlength="2000"><button class="primary">Send</button></form>
+    </div>
+    <input id="kbd" type="text" autocapitalize="off" autocomplete="off" spellcheck="false">
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let ws = null, usePassword = false, needCode = false, perms = {control: true, clipboard: true};
+let remoteW = 0, remoteH = 0, decoder = null, decoderCodec = null, chunkTs = 0, h264 = false, privacyOn = false;
+const canvas = $("screen"), ctx = canvas.getContext("2d", {alpha: false});
+
+// ---------------------------------------------------------------- sign-in
+$("swap").onclick = () => {
+  usePassword = !usePassword;
+  $("userrow").classList.toggle("hidden", !usePassword);
+  $("secretlabel").textContent = usePassword ? "Password" : "PIN";
+  $("secret").inputMode = usePassword ? "text" : "numeric";
+  $("swap").textContent = usePassword ? "Use the computer's PIN" : "Use a username and password";
+  $("loginhint").textContent = usePassword ? "Sign in with your account on this computer." : "Enter this computer's PIN to connect.";
+};
+$("loginform").onsubmit = e => { e.preventDefault(); login(); };
+
+function deviceName() {
+  const ua = navigator.userAgent;
+  const os = /Android/.test(ua) ? "Android" : /iPhone|iPad/.test(ua) ? "iOS" : /Windows/.test(ua) ? "Windows" :
+    /Mac OS/.test(ua) ? "macOS" : /Linux/.test(ua) ? "Linux" : "device";
+  const br = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  return br + " on " + os;
+}
+
+function openSocket(then) {
+  if (ws && ws.readyState === 1) return then();
+  ws = new WebSocket("wss://" + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = then;
+  ws.onmessage = onMessage;
+  ws.onclose = () => {
+    if (!$("session").classList.contains("hidden")) ended("The connection was closed.");
+    else $("loginerr").textContent = "Couldn't reach the computer.";
+    ws = null;
+  };
+}
+
+function login() {
+  $("loginerr").textContent = "";
+  $("go").disabled = true;
+  const secret = $("secret").value;
+  const m = {t: "login", device: deviceName(), user: usePassword ? $("user").value.trim() : ""};
+  if (usePassword) m.password = secret; else m.pin = secret;
+  if (needCode) m.code = $("code").value.trim();
+  openSocket(() => send(m));
+}
+
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+
+// ---------------------------------------------------------------- messages
+function onMessage(ev) {
+  if (typeof ev.data !== "string") return picture(new DataView(ev.data), new Uint8Array(ev.data));
+  const m = JSON.parse(ev.data);
+  switch (m.t) {
+    case "ok": started(m); break;
+    case "denied": $("go").disabled = false; $("loginerr").textContent = m.why; break;
+    case "needcode":
+      $("go").disabled = false;
+      if (needCode) $("loginerr").textContent = "Enter the code from your authenticator app.";
+      needCode = true; $("coderow").classList.remove("hidden"); $("code").focus(); break;
+    case "status": $("status").textContent = m.text; if (!remoteW) $("wait").textContent = m.text; break;
+    case "codec": $("codec").value = m.h264 ? "smooth" : "sharp"; h264 = m.h264; break;
+    case "displays": displays(m); break;
+    case "clip": if (navigator.clipboard) navigator.clipboard.writeText(m.text).catch(() => {}); break;
+    case "viewers": break;
+    case "pong": $("status").title = "Round trip " + (Date.now() % 1e9 - m.v) + " ms"; break;
+    case "cursor": cursor(m); break;
+    case "privacy":
+      privacyOn = m.on; $("privacy").textContent = m.on ? "Privacy: on" : "Privacy";
+      if (m.note) say(m.note); break;
+    case "chat": chatLine(m.from, m.text); break;
+    case "bye": ended(m.why); break;
+  }
+}
+
+let pingTimer = null;
+function started(m) {
+  perms = m;
+  $("login").classList.add("hidden");
+  $("session").classList.remove("hidden");
+  $("title").textContent = m.host;
+  document.title = m.host + " - RD Remote Desktop";
+  for (const id of ["cad", "keys", "privacy"]) $(id).classList.toggle("hidden", !m.control);
+  const wantSmooth = "VideoDecoder" in window && localStorage.getItem("rd-codec") === "smooth";
+  if (wantSmooth) send({t: "codec", h264: true});
+  if (!("VideoDecoder" in window)) $("codec").querySelector("[value=smooth]").disabled = true;
+  pingTimer = setInterval(() => send({t: "ping", v: Date.now() % 1e9}), 2000);
+  canvas.focus();
+}
+
+function ended(why) {
+  clearInterval(pingTimer);
+  $("wait").classList.remove("hidden");
+  $("wait").innerHTML = "";
+  const box = document.createElement("div");
+  box.style.textAlign = "center";
+  const t = document.createElement("p"); t.textContent = why || "Session ended";
+  const b = document.createElement("button"); b.className = "primary"; b.textContent = "Connect again";
+  b.onclick = () => location.reload();
+  box.append(t, b); $("wait").append(box);
+  canvas.classList.add("hidden");
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+}
+
+function say(text) { $("status").textContent = text; }
+
+function displays(m) {
+  const sel = $("display");
+  sel.innerHTML = "";
+  for (const d of m.list) {
+    const o = document.createElement("option");
+    o.value = d.i; o.textContent = d.name + " " + d.w + "x" + d.h; sel.append(o);
+  }
+  sel.value = m.current;
+  sel.classList.toggle("hidden", m.list.length < 2 || !perms.control);
+}
+$("display").onchange = e => send({t: "display", i: +e.target.value});
+$("codec").onchange = e => {
+  const smooth = e.target.value === "smooth";
+  localStorage.setItem("rd-codec", e.target.value);
+  send({t: "codec", h264: smooth});
+};
+$("cad").onclick = () => send({t: "cad"});
+$("privacy").onclick = () => send({t: "privacy", on: !privacyOn});
+$("leave").onclick = () => { send({t: "bye"}); ended("You disconnected."); };
+$("full").onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+};
+
+// ---------------------------------------------------------------- pictures
+function resize(w, h) {
+  if (w === remoteW && h === remoteH) return;
+  remoteW = w; remoteH = h;
+  canvas.width = w; canvas.height = h;
+  layout();
+}
+
+function layout() {
+  if (!remoteW) return;
+  const st = $("stage").getBoundingClientRect();
+  const s = Math.min(st.width / remoteW, st.height / remoteH);
+  canvas.style.width = remoteW * s + "px";
+  canvas.style.height = remoteH * s + "px";
+  canvas.style.left = (st.width - remoteW * s) / 2 + "px";
+  canvas.style.top = (st.height - remoteH * s) / 2 + "px";
+}
+window.addEventListener("resize", layout);
+
+function shown() { if (!$("wait").classList.contains("hidden") && remoteW) $("wait").classList.add("hidden"); }
+
+function picture(dv, u8) {
+  const kind = u8[0], w = dv.getUint32(1, true), h = dv.getUint32(5, true), key = u8[9] === 1;
+  if (kind === 1) {
+    if (key || w !== remoteW || h !== remoteH) resize(w, h);
+    let n = dv.getUint32(10, true), off = 14;
+    while (n--) {
+      const x = dv.getUint32(off, true), y = dv.getUint32(off + 4, true), tw = dv.getUint32(off + 8, true),
+        th = dv.getUint32(off + 12, true), len = dv.getUint32(off + 16, true);
+      off += 20;
+      drawTile(u8.subarray(off, off + len), x, y, tw, th);
+      off += len;
+    }
+    shown();
+  } else if (kind === 2) {
+    video(u8.subarray(10), w, h, key);
+  }
+}
+
+// LZ4 block with a 4-byte little-endian size in front (lz4_flex compress_prepend_size).
+function lz4(src) {
+  const size = src[0] | src[1] << 8 | src[2] << 16 | src[3] << 24;
+  const out = new Uint8Array(size);
+  let s = 4, d = 0;
+  const end = src.length;
+  while (s < end) {
+    const tok = src[s++];
+    let lit = tok >> 4;
+    if (lit === 15) { let b; do { b = src[s++]; lit += b; } while (b === 255); }
+    out.set(src.subarray(s, s + lit), d); s += lit; d += lit;
+    if (s >= end) break;
+    const back = src[s] | src[s + 1] << 8; s += 2;
+    let ml = tok & 15;
+    if (ml === 15) { let b; do { b = src[s++]; ml += b; } while (b === 255); }
+    ml += 4;
+    let m = d - back;
+    if (m < 0) throw new Error("bad lz4 data");
+    while (ml--) out[d++] = out[m++];
+  }
+  return out;
+}
+
+function drawTile(data, x, y, w, h) {
+  let bgr;
+  try { bgr = lz4(data); } catch (e) { send({t: "keyframe"}); return; }
+  const img = ctx.createImageData(w, h), px = img.data;
+  for (let i = 0, j = 0; j < w * h * 3; i += 4, j += 3) {
+    px[i] = bgr[j + 2]; px[i + 1] = bgr[j + 1]; px[i + 2] = bgr[j]; px[i + 3] = 255;
+  }
+  ctx.putImageData(img, x, y);
+}
+
+// H.264 (Annex B) through WebCodecs. The codec string comes from the stream's SPS.
+function codecFromSps(u8) {
+  for (let i = 0; i + 7 < u8.length; i++) {
+    if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1 && (u8[i + 3] & 0x1f) === 7) {
+      const hex = v => v.toString(16).padStart(2, "0");
+      return "avc1." + hex(u8[i + 4]) + hex(u8[i + 5]) + hex(u8[i + 6]);
+    }
+  }
+  return null;
+}
+
+function video(data, w, h, key) {
+  if (!("VideoDecoder" in window)) return;
+  if (key) {
+    const codec = codecFromSps(data) || "avc1.42e01f";
+    if (!decoder || decoder.state === "closed" || codec !== decoderCodec) {
+      if (decoder && decoder.state !== "closed") decoder.close();
+      decoder = new VideoDecoder({
+        output: frame => { resize(frame.displayWidth, frame.displayHeight); ctx.drawImage(frame, 0, 0); frame.close(); shown(); },
+        error: () => { decoder = null; send({t: "keyframe"}); },
+      });
+      decoder.configure({codec, optimizeForLatency: true});
+      decoderCodec = codec;
+    }
+  }
+  if (!decoder || decoder.state !== "configured") return;
+  try {
+    decoder.decode(new EncodedVideoChunk({type: key ? "key" : "delta", timestamp: chunkTs++ * 1000, data}));
+  } catch (e) { decoder = null; send({t: "keyframe"}); }
+}
+
+// ---------------------------------------------------------------- pointer shape
+function cursor(m) {
+  if (m.hidden || !m.rgba) { canvas.style.cursor = "none"; return; }
+  const bin = atob(m.rgba), c = document.createElement("canvas");
+  c.width = m.w; c.height = m.h;
+  const g = c.getContext("2d"), img = g.createImageData(m.w, m.h);
+  for (let i = 0; i < bin.length; i++) img.data[i] = bin.charCodeAt(i);
+  g.putImageData(img, 0, 0);
+  canvas.style.cursor = "url(" + c.toDataURL() + ") " + m.hx + " " + m.hy + ", default";
+}
+
+// ---------------------------------------------------------------- mouse and touch
+function toRemote(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.round((e.clientX - r.left) / r.width * remoteW), y = Math.round((e.clientY - r.top) / r.height * remoteH);
+  return {x: Math.max(0, Math.min(remoteW - 1, x)), y: Math.max(0, Math.min(remoteH - 1, y))};
+}
+const BUTTON = [0, 2, 1, 3, 4]; // browser left, middle, right, back, forward -> left, right, middle...
+const touches = new Map();
+let longPress = null, scrollY = null;
+
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("pointerdown", e => {
+  if (!perms.control || !remoteW) return;
+  canvas.focus();
+  if (e.pointerType === "touch") {
+    touches.set(e.pointerId, e);
+    if (touches.size === 2) { cancelLong(); send({t: "btn", b: 0, down: false}); scrollY = avgY(); return; }
+    const p = toRemote(e);
+    send({t: "move", x: p.x, y: p.y});
+    longPress = setTimeout(() => { longPress = "fired"; send({t: "btn", b: 1, down: true}); send({t: "btn", b: 1, down: false}); }, 550);
+    return;
+  }
+  canvas.setPointerCapture(e.pointerId);
+  const p = toRemote(e);
+  send({t: "move", x: p.x, y: p.y});
+  send({t: "btn", b: BUTTON[e.button] ?? 0, down: true});
+  e.preventDefault();
+});
+canvas.addEventListener("pointermove", e => {
+  if (!perms.control || !remoteW) return;
+  if (e.pointerType === "touch") {
+    if (!touches.has(e.pointerId)) return;
+    touches.set(e.pointerId, e);
+    if (touches.size === 2 && scrollY !== null) {
+      const y = avgY(), d = Math.round((y - scrollY) * 4);
+      if (Math.abs(d) >= 10) { send({t: "wheel", dx: 0, dy: d}); scrollY = y; }
+      return;
+    }
+    if (longPress && longPress !== "fired") {
+      clearTimeout(longPress); longPress = null;
+      send({t: "btn", b: 0, down: true}); // dragging: hold the left button
+    }
+  }
+  for (const ev of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e]).slice(-1)) {
+    const p = toRemote(ev);
+    send({t: "move", x: p.x, y: p.y});
+  }
+});
+function avgY() { let s = 0; for (const t of touches.values()) s += t.clientY; return s / touches.size; }
+function cancelLong() { if (longPress && longPress !== "fired") clearTimeout(longPress); longPress = null; }
+function pointerUp(e) {
+  if (!perms.control) return;
+  if (e.pointerType === "touch") {
+    const had = touches.size;
+    touches.delete(e.pointerId);
+    if (had === 2) { scrollY = null; return; }
+    if (longPress === "fired") { longPress = null; return; }
+    if (longPress) { cancelLong(); send({t: "btn", b: 0, down: true}); } // a tap: click
+    send({t: "btn", b: 0, down: false});
+    return;
+  }
+  send({t: "btn", b: BUTTON[e.button] ?? 0, down: false});
+}
+canvas.addEventListener("pointerup", pointerUp);
+canvas.addEventListener("pointercancel", e => { touches.delete(e.pointerId); cancelLong(); });
+canvas.addEventListener("wheel", e => {
+  if (!perms.control) return;
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1;
+  send({t: "wheel", dx: Math.round(e.deltaX * unit * 1.2), dy: -Math.round(e.deltaY * unit * 1.2)});
+}, {passive: false});
+
+// ---------------------------------------------------------------- keyboard
+// KeyboardEvent.code -> Linux evdev key code (what the host expects).
+const KEYS = {
+  Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11,
+  Minus: 12, Equal: 13, Backspace: 14, Tab: 15, KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyU: 22,
+  KeyI: 23, KeyO: 24, KeyP: 25, BracketLeft: 26, BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30, KeyS: 31,
+  KeyD: 32, KeyF: 33, KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38, Semicolon: 39, Quote: 40, Backquote: 41,
+  ShiftLeft: 42, Backslash: 43, KeyZ: 44, KeyX: 45, KeyC: 46, KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50, Comma: 51,
+  Period: 52, Slash: 53, ShiftRight: 54, NumpadMultiply: 55, AltLeft: 56, Space: 57, CapsLock: 58, F1: 59, F2: 60,
+  F3: 61, F4: 62, F5: 63, F6: 64, F7: 65, F8: 66, F9: 67, F10: 68, NumLock: 69, ScrollLock: 70, Numpad7: 71,
+  Numpad8: 72, Numpad9: 73, NumpadSubtract: 74, Numpad4: 75, Numpad5: 76, Numpad6: 77, NumpadAdd: 78, Numpad1: 79,
+  Numpad2: 80, Numpad3: 81, Numpad0: 82, NumpadDecimal: 83, IntlBackslash: 86, F11: 87, F12: 88, IntlRo: 89,
+  NumpadEnter: 96, ControlRight: 97, NumpadDivide: 98, PrintScreen: 99, AltRight: 100, Home: 102, ArrowUp: 103,
+  PageUp: 104, ArrowLeft: 105, ArrowRight: 106, End: 107, ArrowDown: 108, PageDown: 109, Insert: 110, Delete: 111,
+  AudioVolumeMute: 113, AudioVolumeDown: 114, AudioVolumeUp: 115, NumpadEqual: 117, Pause: 119, IntlYen: 124,
+  MetaLeft: 125, MetaRight: 126, ContextMenu: 127, OSLeft: 125, OSRight: 126,
+};
+const held = new Set();
+function typingInPage(e) { return e.target === $("chatin") || e.target === $("kbd"); }
+window.addEventListener("keydown", e => {
+  if ($("session").classList.contains("hidden") || typingInPage(e) || !perms.control) return;
+  const code = KEYS[e.code];
+  if (code === undefined) return;
+  e.preventDefault();
+  if (e.repeat && held.has(code)) { send({t: "key", code, down: true}); return; }
+  held.add(code);
+  send({t: "key", code, down: true});
+});
+window.addEventListener("keyup", e => {
+  if ($("session").classList.contains("hidden") || typingInPage(e) || !perms.control) return;
+  const code = KEYS[e.code];
+  if (code === undefined) return;
+  e.preventDefault();
+  held.delete(code);
+  send({t: "key", code, down: false});
+});
+window.addEventListener("blur", () => { held.clear(); send({t: "release"}); });
+
+// Phones: an invisible text box brings up the on-screen keyboard; typed characters
+// are sent as key presses (US layout).
+const CHARS = {};
+"1234567890".split("").forEach((c, i) => CHARS[c] = [i + 2, false]);
+"!@#$%^&*()".split("").forEach((c, i) => CHARS[c] = [i + 2, true]);
+"qwertyuiop".split("").forEach((c, i) => { CHARS[c] = [16 + i, false]; CHARS[c.toUpperCase()] = [16 + i, true]; });
+"asdfghjkl".split("").forEach((c, i) => { CHARS[c] = [30 + i, false]; CHARS[c.toUpperCase()] = [30 + i, true]; });
+"zxcvbnm".split("").forEach((c, i) => { CHARS[c] = [44 + i, false]; CHARS[c.toUpperCase()] = [44 + i, true]; });
+Object.assign(CHARS, {" ": [57, false], "\n": [28, false], "-": [12, false], "_": [12, true], "=": [13, false], "+": [13, true],
+  "[": [26, false], "{": [26, true], "]": [27, false], "}": [27, true], ";": [39, false], ":": [39, true], "'": [40, false],
+  "\"": [40, true], "`": [41, false], "~": [41, true], "\\": [43, false], "|": [43, true], ",": [51, false], "<": [51, true],
+  ".": [52, false], ">": [52, true], "/": [53, false], "?": [53, true]});
+function tap(code, shift) {
+  if (shift) send({t: "key", code: 42, down: true});
+  send({t: "key", code, down: true}); send({t: "key", code, down: false});
+  if (shift) send({t: "key", code: 42, down: false});
+}
+$("keys").onclick = () => { $("kbd").value = ""; $("kbd").focus(); };
+$("kbd").addEventListener("input", e => {
+  if (e.inputType === "deleteContentBackward") tap(14, false);
+  else for (const ch of e.data || "") { const k = CHARS[ch]; if (k) tap(k[0], k[1]); }
+  $("kbd").value = "";
+});
+$("kbd").addEventListener("keydown", e => {
+  if (e.key === "Backspace") { tap(14, false); e.preventDefault(); }
+  else if (e.key === "Enter") { tap(28, false); e.preventDefault(); }
+});
+
+// Paste: the browser's clipboard text goes to the remote computer first.
+document.addEventListener("paste", e => {
+  if (!perms.clipboard || typingInPage(e)) return;
+  const text = e.clipboardData && e.clipboardData.getData("text/plain");
+  if (text) send({t: "clip", text});
+});
+
+// ---------------------------------------------------------------- chat
+let unread = 0;
+$("chatbtn").onclick = () => {
+  const open = $("chat").classList.toggle("hidden") === false;
+  if (open) { unread = 0; $("unread").classList.add("hidden"); $("chatin").focus(); }
+};
+$("chatform").onsubmit = e => {
+  e.preventDefault();
+  const text = $("chatin").value.trim();
+  if (!text) return;
+  send({t: "chat", text});
+  chatLine("You", text);
+  $("chatin").value = "";
+};
+function chatLine(from, text) {
+  const d = document.createElement("div"), f = document.createElement("div"), t = document.createElement("div");
+  f.className = "from"; f.textContent = from; t.textContent = text;
+  d.append(f, t); d.style.marginBottom = "6px";
+  $("chatlog").append(d); $("chatlog").scrollTop = 1e9;
+  if ($("chat").classList.contains("hidden")) {
+    unread++; $("unread").textContent = unread; $("unread").classList.remove("hidden");
+  }
+}
+</script>
+</body>
+</html>

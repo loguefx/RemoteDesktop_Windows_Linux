@@ -18,6 +18,7 @@ mod clip;
 mod daemon;
 mod db;
 mod files;
+mod gamepad;
 mod notice;
 mod paths;
 mod prompt;
@@ -25,7 +26,9 @@ mod reach;
 mod relay_link;
 mod service;
 mod spawn;
+mod totp;
 mod video_pipe;
+mod web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -110,6 +113,15 @@ enum Cmd {
         /// Don't copy the app (rd-client) or add it to the Start menu / application menu.
         #[arg(long)]
         no_app: bool,
+        /// Ask the person at this computer before anyone connects: on or off.
+        #[arg(long)]
+        ask_to_allow: Option<String>,
+        /// The browser viewer on the same port: on (default) or off.
+        #[arg(long)]
+        web: Option<String>,
+        /// Update the installed service with this program, keeping every setting.
+        #[arg(long, conflicts_with_all = ["owner", "pin_file", "admin_user", "name"])]
+        update: bool,
         /// Write "ok" or "error: ..." here when done (used by the app, which can't see
         /// the output of an elevated process).
         #[arg(long)]
@@ -226,6 +238,8 @@ enum UserCmd {
     Enable { username: String },
     /// Clear a lockout caused by failed logins.
     Unlock { username: String },
+    /// Turn off two-step sign-in (when the authenticator app is lost).
+    TotpOff { username: String },
 }
 
 #[derive(Subcommand)]
@@ -309,6 +323,8 @@ pub(crate) fn load_config(data_dir: PathBuf, spawn_mode: spawn::SpawnMode, agent
         (Some(h), Some(u)) => Some((h, u)),
         _ => None,
     };
+    let ask_to_allow = get("ask_to_allow").as_deref() == Some("on");
+    let web = get("web").as_deref() != Some("off");
     Ok(daemon::Config {
         data_dir,
         bind,
@@ -324,6 +340,8 @@ pub(crate) fn load_config(data_dir: PathBuf, spawn_mode: spawn::SpawnMode, agent
         owner,
         upnp,
         ddns,
+        ask_to_allow,
+        web,
     })
 }
 
@@ -448,10 +466,26 @@ fn main() -> Result<()> {
             ddns_off,
             wake_on_lan,
             no_app,
+            ask_to_allow,
+            web,
+            update,
             result_file,
         } => {
             init_logging(None);
             let r = (|| {
+                if update {
+                    return service::update(data_dir.clone(), !no_app);
+                }
+                let on_off = |v: &Option<String>, what: &str| -> Result<Option<bool>> {
+                    match v.as_deref() {
+                        None => Ok(None),
+                        Some("on") => Ok(Some(true)),
+                        Some("off") => Ok(Some(false)),
+                        Some(o) => anyhow::bail!("--{what} takes on or off, not '{o}'"),
+                    }
+                };
+                let ask_to_allow = on_off(&ask_to_allow, "ask-to-allow")?;
+                let web = on_off(&web, "web")?;
                 video_encoder.parse::<rd_core::video::EncoderChoice>().map_err(|e| anyhow::anyhow!(e))?;
                 let pin = match &pin_file {
                     Some(f) => {
@@ -488,6 +522,9 @@ fn main() -> Result<()> {
                     ddns_off,
                     wake_on_lan,
                     app: !no_app,
+                    ask_to_allow,
+                    web,
+                    keep_settings: false,
                 })
             })();
             if let Some(f) = &result_file {
@@ -566,7 +603,7 @@ fn main() -> Result<()> {
         Cmd::Info => {
             let db = db::Db::open(&data_dir)?;
             println!("data dir:     {}", data_dir.display());
-            for k in ["name", "owner", "upnp", "port", "bind", "listen", "backend", "fps", "max_viewers", "video_kbps", "video_encoder", "relay_addr", "relay_id"] {
+            for k in ["name", "owner", "upnp", "ask_to_allow", "web", "port", "bind", "listen", "backend", "fps", "max_viewers", "video_kbps", "video_encoder", "relay_addr", "relay_id"] {
                 println!("{k:<13} {}", db.setting(k)?.unwrap_or_else(|| "(default)".into()));
             }
             #[cfg(windows)]
@@ -677,6 +714,10 @@ fn user_cmd(data_dir: &std::path::Path, cmd: UserCmd) -> Result<()> {
         UserCmd::Unlock { username } => {
             db.unlock(&username)?;
             println!("Unlocked '{username}'.");
+        }
+        UserCmd::TotpOff { username } => {
+            db.totp_disable(&username)?;
+            println!("Two-step sign-in is off for '{username}'.");
         }
     }
     Ok(())

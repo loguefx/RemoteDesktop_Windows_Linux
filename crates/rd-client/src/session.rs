@@ -71,6 +71,12 @@ pub struct State {
     /// The remote pointer's look, and a counter bumped on every change.
     pub cursor: Option<rd_core::proto::CursorShape>,
     pub cursor_seq: u64,
+    /// The privacy screen is on, and why it isn't when asked for.
+    pub privacy: bool,
+    pub privacy_note: Option<String>,
+    /// Chat: (from, text), newest last; messages not yet seen.
+    pub chat: Vec<(String, String)>,
+    pub chat_unread: u32,
 }
 
 impl State {
@@ -103,6 +109,11 @@ impl Handle {
 
     pub fn send(&self, msg: ClientMsg) {
         let _ = self.tx.send(msg);
+    }
+
+    /// For other threads that send to the host (system shortcuts, controllers).
+    pub fn sender(&self) -> mpsc::UnboundedSender<ClientMsg> {
+        self.tx.clone()
     }
 
     fn req(&self) -> u32 {
@@ -306,6 +317,17 @@ async fn network(
                     if c.is_valid() {
                         s.cursor = Some(c);
                         s.cursor_seq += 1;
+                    }
+                }
+                HostMsg::Privacy { on, note } => {
+                    s.privacy = on;
+                    s.privacy_note = note;
+                }
+                HostMsg::Chat { from, text } => {
+                    s.chat.push((from, text));
+                    s.chat_unread += 1;
+                    if s.chat.len() > 500 {
+                        s.chat.remove(0);
                     }
                 }
                 HostMsg::Pong(sent) => {

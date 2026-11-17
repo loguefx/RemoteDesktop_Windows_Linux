@@ -36,8 +36,9 @@ pub struct Session {
 pub enum Creds {
     /// Use the saved device token for this user (or the last user).
     Saved(Option<String>),
-    Password { username: String, password: String },
-    Pin { username: String, pin: String },
+    /// `code`: from an authenticator app, for accounts with two-step sign-in.
+    Password { username: String, password: String, code: Option<String> },
+    Pin { username: String, pin: String, code: Option<String> },
 }
 
 pub enum Outcome {
@@ -46,6 +47,8 @@ pub enum Outcome {
     NeedTrust(String),
     /// No saved sign-in (or it was rejected); `message` explains why.
     NeedCredentials { username: Option<String>, message: Option<String> },
+    /// Two-step sign-in: try again with the same credential and a code.
+    NeedCode,
     Denied(String),
 }
 
@@ -188,21 +191,22 @@ async fn open_computer(c: &Computer) -> Result<(Stream, String)> {
 enum SignIn {
     Ok { stream: Stream, user: UserInfo, host_name: String },
     NeedCredentials { username: Option<String>, message: Option<String> },
+    NeedCode,
     Denied(String),
 }
 
 /// Sign in on an open connection, updating `entry` (saved user and device tokens).
 async fn sign_in(mut stream: Stream, entry: &mut HostEntry, mode: Mode, creds: Creds, remember: bool) -> Result<SignIn> {
-    let (username, credential, used_token) = match creds {
+    let (username, credential, used_token, code) = match creds {
         Creds::Saved(user) => {
             let user = user.or_else(|| entry.username.clone());
             match user.as_deref().and_then(|u| entry.token(u).cloned()) {
-                Some(tok) => (user.unwrap(), Credential::DeviceToken(tok), true),
+                Some(tok) => (user.unwrap(), Credential::DeviceToken(tok), true, None),
                 None => return Ok(SignIn::NeedCredentials { username: user, message: None }),
             }
         }
-        Creds::Password { username, password } => (username, Credential::Password(password), false),
-        Creds::Pin { username, pin } => (username, Credential::Pin(pin), false),
+        Creds::Password { username, password, code } => (username, Credential::Password(password), false, code),
+        Creds::Pin { username, pin, code } => (username, Credential::Pin(pin), false, code),
     };
     let hello = ClientHello {
         version: PROTOCOL_VERSION,
@@ -211,6 +215,7 @@ async fn sign_in(mut stream: Stream, entry: &mut HostEntry, mode: Mode, creds: C
         remember_device_as: (remember && !used_token).then(device_name),
         mode,
         device: device_name(),
+        code,
     };
     write_msg(&mut stream, &hello).await?;
     match read_msg::<_, LoginResult>(&mut stream).await? {
@@ -229,6 +234,7 @@ async fn sign_in(mut stream: Stream, entry: &mut HostEntry, mode: Mode, creds: C
             })
         }
         LoginResult::Denied(why) => Ok(SignIn::Denied(why)),
+        LoginResult::NeedCode => Ok(SignIn::NeedCode),
     }
 }
 
@@ -251,6 +257,7 @@ pub async fn connect_computer(key: &str, mode: Mode, creds: Creds, remember: boo
             Outcome::Ok(Session { stream, user, host_name, route, key: key.to_string() })
         }
         SignIn::NeedCredentials { username, message } => Outcome::NeedCredentials { username, message },
+        SignIn::NeedCode => Outcome::NeedCode,
         SignIn::Denied(why) => Outcome::Denied(why),
     })
 }
@@ -287,6 +294,7 @@ pub async fn connect_flow(
     Ok(match r {
         SignIn::Ok { stream, user, host_name } => Outcome::Ok(Session { stream, user, host_name, route, key }),
         SignIn::NeedCredentials { username, message } => Outcome::NeedCredentials { username, message },
+        SignIn::NeedCode => Outcome::NeedCode,
         SignIn::Denied(why) => Outcome::Denied(why),
     })
 }
@@ -341,9 +349,9 @@ pub async fn login(target: &str, mode: Mode, opts: &LoginOptions) -> Result<Sess
                 };
                 username = Some(user.clone());
                 if opts.use_pin {
-                    Creds::Pin { pin: secret("RD_PIN", &format!("PIN for {user}: "))?, username: user }
+                    Creds::Pin { pin: secret("RD_PIN", &format!("PIN for {user}: "))?, username: user, code: None }
                 } else {
-                    Creds::Password { password: secret("RD_PASSWORD", &format!("Password for {user}: "))?, username: user }
+                    Creds::Password { password: secret("RD_PASSWORD", &format!("Password for {user}: "))?, username: user, code: None }
                 }
             }
         };
@@ -374,6 +382,17 @@ pub async fn login(target: &str, mode: Mode, opts: &LoginOptions) -> Result<Sess
                 }
                 username = username.or(u);
                 creds = None;
+            }
+            Outcome::NeedCode => {
+                let code = match std::env::var("RD_CODE") {
+                    Ok(c) if !c.is_empty() => c,
+                    _ => ask("Code from your authenticator app: ")?,
+                };
+                creds = Some(match attempt {
+                    Creds::Pin { username, pin, .. } => Creds::Pin { username, pin, code: Some(code) },
+                    Creds::Password { username, password, .. } => Creds::Password { username, password, code: Some(code) },
+                    saved => saved,
+                });
             }
             Outcome::Denied(why) => bail!("sign-in refused: {why}"),
         }

@@ -20,6 +20,12 @@ pub struct Store {
     /// Computers found on the network or connected to before, by certificate fingerprint.
     #[serde(default)]
     pub computers: BTreeMap<String, Computer>,
+    /// Lock the remote computer when disconnecting (default on).
+    #[serde(default)]
+    pub lock_on_leave: Option<bool>,
+    /// Send system shortcuts (Windows key, Alt+Tab...) to the remote computer.
+    #[serde(default)]
+    pub system_shortcuts: bool,
 }
 
 /// A computer in "My computers": how to find it and how to sign in.

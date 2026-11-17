@@ -13,9 +13,13 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
   - the remote screen with a toolbar (it slides down from the top edge in full screen) and a
     connection badge: direct or relay, round-trip time, frames per second
   - **Wake up** for sleeping computers (Wake-on-LAN), **rename on this device**, last-connected times
-  - a file panel
-  - an accounts screen
+  - a file panel, chat, and a **More** menu: lock on disconnect, privacy screen, system
+    shortcuts, fit the resolution to the window, gaming mode (controllers too)
+  - an accounts screen, with two-step sign-in (authenticator app codes)
+  - **Update now** when a new release is out
   - a CLI for scripting
+- **Browser viewer:** any modern browser, including a phone's, can connect to the host's own address
+  (`https://<computer>:47800`) without installing anything.
 - **Relay** (`rd-relay`) is an optional rendezvous server. It lets you reach hosts behind NAT
   or firewalls from anywhere, without opening ports on the host. Where the NATs allow it, the two
   sides then connect **directly (peer-to-peer)** and the relay carries nothing but the setup.
@@ -23,8 +27,10 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
   - multiple users, with admin/user roles
   - per-user *view*, *control*, *clipboard* and *files* permissions
   - the first account created is always the admin
-- **Sign-in** is by PIN (4-12 digits) or password. A saved device token ("don't ask again on this
-  device") signs you in automatically after that.
+- **Sign-in** is by PIN (4-12 digits) or password, plus an authenticator app code for accounts with
+  **two-step sign-in**. A saved device token ("don't ask again on this device") signs you in
+  automatically after that.
+- **Ask before connecting** (optional): the person at the computer must click *Allow* first.
 - **Several viewers** can share one desktop at the same time. While anyone is connected, the host's
   screen shows a small *Your screen is being shared* window naming each viewer, with a
   **Disconnect** button for the person at the computer.
@@ -203,6 +209,25 @@ In a session:
   - **Ctrl+Alt+Del**
   - **Sound** on/off
   - **Files**
+  - **Chat** with the person at the remote computer (and anyone else connected); unread messages are counted
+  - **More:**
+    - **Lock the computer when I disconnect** (on by default; remembered). When the last viewer
+      leaves, the remote computer locks, so nobody there can use your signed-in desktop. It doesn't
+      lock when the person at the computer pressed *Disconnect*.
+    - **Privacy screen:** the remote monitor goes black and its own keyboard and mouse are ignored
+      while you're connected. On Windows (10 version 2004 or newer) a black window covers the screen
+      that screen capture leaves out, so you still see the desktop; Ctrl+Alt+Del on that computer
+      always gives control back. On X11 the monitor is switched off (DPMS); remote input wakes it
+      briefly. Not available on Wayland.
+    - **Send system shortcuts:** the Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote
+      computer instead of yours (Windows and X11; Wayland desktops don't allow it).
+    - **Fit its resolution to this window:** the remote screen switches to its largest resolution
+      that fits your window, for sharp, unscaled text. The original comes back when you disconnect.
+      Windows and X11 (the modes the monitor offers); not on Wayland.
+    - **Gaming mode:** the pointer is locked in the window and raw mouse movement is sent, as games
+      expect. Game controllers plugged into your computer appear on the remote one as Xbox
+      controllers (Windows hosts need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)
+      driver; Linux hosts use uinput). **Ctrl+Alt+G** leaves gaming mode.
   - **Full screen**: move the pointer to the top edge to bring the toolbar back; F11 leaves
   - **Disconnect**
   - who else is connected
@@ -218,6 +243,23 @@ In a session:
   - browse the remote user's files and download them;
   - upload with *Upload a file…*, or drop files onto the window;
   - uploads land in the remote user's **Downloads** folder and never overwrite an existing file.
+
+### From a browser
+
+Open `https://<the computer's address>:47800` (the same port as the app) and sign in with the PIN,
+or with a username and password. It works in current Chrome, Edge, Firefox and Safari, on phones
+too.
+
+- **The first time** the browser warns that the certificate isn't trusted: the host makes its own.
+  Compare the fingerprint the browser shows with `rd-host info` on that computer before going on.
+- **What works:** the picture (*Sharp*, or *Smooth* H.264 where the browser has WebCodecs), mouse,
+  keyboard, touch (tap to click, hold for a right click, drag, two fingers to scroll), an on-screen
+  keyboard button for phones, pasting text into the remote computer, chat, Ctrl+Alt+Del, the
+  privacy screen and full screen.
+- **Not in the browser:** sound, file transfer and copying files or images; use the app for those.
+- **Reach:** the direct port only (your network, or the internet with port forwarding or dynamic
+  DNS). Relay ids need the app.
+- **Turning it off:** `rd-host install --web off` (or `on`).
 
 ## Reach a computer from anywhere (relay)
 
@@ -263,6 +305,33 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Two-step sign-in
+
+Two-step sign-in asks for a code from an authenticator app (Google Authenticator, Microsoft
+Authenticator, 2FAS, Aegis...) after the PIN or password, so a guessed or overheard PIN isn't enough.
+
+- **Turn it on:** in the app, open a computer's menu, *Manage accounts*, *Two-step sign-in*, *Turn on*.
+  Scan the QR code (or type the key) and enter the code the app shows.
+- **Signing in:** the app, the browser viewer and the CLI ask for the code (`RD_CODE` for scripts).
+  Each code works once. A device saved with *don't ask again* keeps signing in without one.
+- **Lost the phone:** an admin can turn it off for that account in *Manage accounts*, or on the
+  computer itself: `rd-host user totp-off <name>`.
+
+## Ask before connecting
+
+With *Ask me before anyone connects* on (in **Set up remote access** / **Change name or PIN**, or
+`rd-host install --ask-to-allow on`), every connection waits until the person at the computer clicks
+**Allow** in the window that appears there. *Don't allow*, or no answer within a minute, refuses it.
+Nobody signed in on the computer means nobody can answer, so leave it off for computers you reach
+while you're away.
+
+## Updates
+
+When a new release is out, the app shows *Update now*. It downloads the release for your system,
+checks it against the SHA-256 checksum GitHub publishes for it, and installs it with administrator
+rights (`rd-host install --update`, which keeps every setting, account and the certificate). Then
+the new app starts.
 
 ## Users and permissions
 

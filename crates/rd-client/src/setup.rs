@@ -21,6 +21,8 @@ pub struct SetupRequest {
     pub ddns_off: bool,
     /// Let the network adapter wake the computer (Wake-on-LAN).
     pub wake_on_lan: bool,
+    /// Ask the person at the computer before anyone connects.
+    pub ask_to_allow: bool,
 }
 
 pub const DUCKDNS_SUFFIX: &str = ".duckdns.org";
@@ -148,7 +150,18 @@ pub fn set_up(req: &SetupRequest) -> Result<()> {
     if req.wake_on_lan {
         args.push("--wake-on-lan".into());
     }
+    args.push("--ask-to-allow".into());
+    args.push(if req.ask_to_allow { "on" } else { "off" }.into());
     run_elevated(&exe, &args, &result_file)
+}
+
+/// Replace the installed service and app with `host` (a newer rd-host, with rd-client
+/// beside it), keeping all settings.
+pub fn update_service(host: &Path) -> Result<()> {
+    let scratch = Scratch::new()?;
+    let result_file = scratch.0.join("result");
+    let args = vec!["install".into(), "--update".into(), "--result-file".into(), result_file.display().to_string()];
+    run_elevated(host, &args, &result_file)
 }
 
 /// Stop and remove the host service (keeps its accounts and certificate).
@@ -233,6 +246,7 @@ mod tests {
             ddns: None,
             ddns_off: false,
             wake_on_lan: true,
+            ask_to_allow: false,
         };
         assert!(validate(&req()).is_ok());
         assert!(validate(&SetupRequest { pin: "123".into(), ..req() }).is_err());

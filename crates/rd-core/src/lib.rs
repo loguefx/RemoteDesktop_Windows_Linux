@@ -36,4 +36,4 @@ pub mod p2p;
 /// Default TCP port the host service listens on.
 pub const DEFAULT_PORT: u16 = 47800;
 /// Bumped whenever the wire protocol changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;

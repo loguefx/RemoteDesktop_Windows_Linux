@@ -74,6 +74,8 @@ pub enum AuthError {
     Disabled,
     /// Too many wrong PINs; the PIN must be set again on the host.
     PinDisabled,
+    /// Two-step sign-in is on and no code was given (nothing was checked yet).
+    NeedCode,
 }
 
 impl std::fmt::Display for AuthError {
@@ -85,6 +87,7 @@ impl std::fmt::Display for AuthError {
             AuthError::PinDisabled => f.write_str(
                 "the PIN was switched off after too many wrong tries; set a new PIN on that computer",
             ),
+            AuthError::NeedCode => f.write_str("enter the code from your authenticator app"),
         }
     }
 }
@@ -111,6 +114,10 @@ fn token_hash(token: &str) -> String {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2).filter_map(|i| u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()).collect()
 }
 
 pub fn random_token() -> String {
@@ -160,6 +167,17 @@ impl Db {
                 if let Some(src) = copy_from {
                     conn.execute_batch(&format!("UPDATE users SET {col} = {src}"))?;
                 }
+            }
+        }
+        // v8: two-step sign-in (secret, secret being set up, last time step used).
+        for (col, ty) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_step", "INTEGER NOT NULL DEFAULT 0")] {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = ?1",
+                [col],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE users ADD COLUMN {col} {ty}"))?;
             }
         }
         Ok(Self { conn })
@@ -222,6 +240,7 @@ impl Db {
             },
             has_pin: r.get::<_, Option<String>>("pin_hash")?.is_some(),
             disabled: r.get("disabled")?,
+            has_totp: r.get::<_, Option<String>>("totp_secret")?.is_some(),
         })
     }
 
@@ -333,7 +352,10 @@ impl Db {
 
     // ------------------------------------------------------------ authentication
 
-    pub fn authenticate(&self, username: &str, cred: &Credential) -> Result<Result<UserInfo, AuthError>> {
+    /// Check a sign-in. Accounts with two-step sign-in also need `code` (a remembered
+    /// device doesn't); without one the answer is [`AuthError::NeedCode`] before anything
+    /// is checked, so asking never reveals whether a PIN was right.
+    pub fn authenticate(&self, username: &str, cred: &Credential, code: Option<&str>) -> Result<Result<UserInfo, AuthError>> {
         struct Row {
             id: i64,
             password_hash: String,
@@ -341,11 +363,13 @@ impl Db {
             disabled: bool,
             failed: i64,
             locked_until: Option<i64>,
+            totp: Option<String>,
+            totp_step: i64,
         }
         let row = self
             .conn
             .query_row(
-                "SELECT id, password_hash, pin_hash, disabled, failed_attempts, locked_until FROM users WHERE username = ?1",
+                "SELECT id, password_hash, pin_hash, disabled, failed_attempts, locked_until, totp_secret, totp_step FROM users WHERE username = ?1",
                 [username],
                 |r| {
                     Ok(Row {
@@ -355,6 +379,8 @@ impl Db {
                         disabled: r.get(3)?,
                         failed: r.get(4)?,
                         locked_until: r.get(5)?,
+                        totp: r.get(6)?,
+                        totp_step: r.get(7)?,
                     })
                 },
             )
@@ -378,8 +404,11 @@ impl Db {
             if let Some(until) = row.locked_until.filter(|u| *u > t) {
                 return Ok(Err(AuthError::Locked(until - t)));
             }
+            if row.totp.is_some() && code.is_none_or(|c| c.trim().is_empty()) {
+                return Ok(Err(AuthError::NeedCode));
+            }
         }
-        let ok = match cred {
+        let secret_ok = match cred {
             Credential::Password(p) => verify_secret(p, &row.password_hash),
             Credential::Pin(p) => row.pin_hash.as_deref().is_some_and(|h| verify_secret(p, h)),
             Credential::DeviceToken(tok) => {
@@ -390,6 +419,20 @@ impl Db {
                 n == 1
             }
         };
+        // The two-step code (each code works once).
+        let mut used_step = None;
+        let ok = secret_ok
+            && match (&row.totp, is_token) {
+                (Some(secret), false) => {
+                    let secret = unhex(secret);
+                    used_step = crate::totp::check(&secret, code.unwrap_or(""), t as u64, row.totp_step as u64);
+                    used_step.is_some()
+                }
+                _ => true,
+            };
+        if let Some(step) = used_step {
+            self.conn.execute("UPDATE users SET totp_step = ?2 WHERE id = ?1", params![row.id, step as i64])?;
+        }
         if !ok && is_token {
             // A wrong token is not a guess at the user's secret; don't count it.
             return Ok(Err(AuthError::Invalid));
@@ -419,6 +462,36 @@ impl Db {
             self.conn.execute("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1", [row.id])?;
         }
         Ok(Ok(self.get_user(username)?.expect("user exists")))
+    }
+
+    // ------------------------------------------------------------ two-step sign-in
+
+    /// Start setting up two-step sign-in: a new secret, kept aside until confirmed.
+    pub fn totp_begin(&self, username: &str) -> Result<Vec<u8>> {
+        self.require_user(username)?;
+        let secret = crate::totp::new_secret();
+        self.conn.execute("UPDATE users SET totp_pending = ?2 WHERE username = ?1", params![username, hex(&secret)])?;
+        Ok(secret)
+    }
+
+    /// Confirm with a code from the app; from then on sign-ins need a code.
+    pub fn totp_enable(&self, username: &str, code: &str) -> Result<()> {
+        let pending: Option<String> =
+            self.conn.query_row("SELECT totp_pending FROM users WHERE username = ?1", [username], |r| r.get(0)).optional()?.flatten();
+        let pending = pending.context("start setting up two-step sign-in first")?;
+        let step = crate::totp::check(&unhex(&pending), code, now() as u64, 0)
+            .context("that code isn't right; check the time on your phone and try the newest code")?;
+        self.conn.execute(
+            "UPDATE users SET totp_secret = totp_pending, totp_pending = NULL, totp_step = ?2 WHERE username = ?1",
+            params![username, step as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn totp_disable(&self, username: &str) -> Result<()> {
+        self.require_user(username)?;
+        self.conn.execute("UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_step = 0 WHERE username = ?1", [username])?;
+        Ok(())
     }
 
     // ------------------------------------------------------------ devices
@@ -495,19 +568,19 @@ mod tests {
         assert_eq!(role, Role::User);
         assert!(db.create_user("BOB", "whatever123", Role::User, Permissions::FULL).is_err(), "case-insensitive unique");
 
-        let ok = db.authenticate("alice", &Credential::Password("correct horse".into())).unwrap().unwrap();
+        let ok = db.authenticate("alice", &Credential::Password("correct horse".into()), None).unwrap().unwrap();
         assert_eq!(ok.role, Role::Admin);
-        assert!(db.authenticate("alice", &Credential::Password("nope".into())).unwrap().is_err());
-        assert!(db.authenticate("nobody", &Credential::Password("x".into())).unwrap().is_err());
+        assert!(db.authenticate("alice", &Credential::Password("nope".into()), None).unwrap().is_err());
+        assert!(db.authenticate("nobody", &Credential::Password("x".into()), None).unwrap().is_err());
 
         // PIN + device token.
         db.set_pin("bob", Some("123456")).unwrap();
-        assert!(db.authenticate("bob", &Credential::Pin("123456".into())).unwrap().is_ok());
+        assert!(db.authenticate("bob", &Credential::Pin("123456".into()), None).unwrap().is_ok());
         let tok = db.add_device("bob", "laptop").unwrap();
-        assert!(db.authenticate("bob", &Credential::DeviceToken(tok.clone())).unwrap().is_ok());
-        assert!(db.authenticate("alice", &Credential::DeviceToken(tok.clone())).unwrap().is_err(), "token bound to user");
+        assert!(db.authenticate("bob", &Credential::DeviceToken(tok.clone()), None).unwrap().is_ok());
+        assert!(db.authenticate("alice", &Credential::DeviceToken(tok.clone()), None).unwrap().is_err(), "token bound to user");
         db.set_password("bob", "new password!").unwrap();
-        assert!(db.authenticate("bob", &Credential::DeviceToken(tok)).unwrap().is_err(), "password change revokes devices");
+        assert!(db.authenticate("bob", &Credential::DeviceToken(tok), None).unwrap().is_err(), "password change revokes devices");
 
         // Last admin protection.
         assert!(db.remove_user("alice").is_err());
@@ -522,12 +595,12 @@ mod tests {
         let (mut db, dir) = tmp();
         db.create_user("carol", "password123", Role::User, Permissions::FULL).unwrap();
         for _ in 0..MAX_FAILURES {
-            let _ = db.authenticate("carol", &Credential::Password("bad".into())).unwrap();
+            let _ = db.authenticate("carol", &Credential::Password("bad".into()), None).unwrap();
         }
-        let r = db.authenticate("carol", &Credential::Password("password123".into())).unwrap();
+        let r = db.authenticate("carol", &Credential::Password("password123".into()), None).unwrap();
         assert!(matches!(r, Err(AuthError::Locked(_))), "correct password rejected while locked");
         db.unlock("carol").unwrap();
-        assert!(db.authenticate("carol", &Credential::Password("password123".into())).unwrap().is_ok());
+        assert!(db.authenticate("carol", &Credential::Password("password123".into()), None).unwrap().is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -541,17 +614,39 @@ mod tests {
         for i in 0..PIN_DISABLE_AFTER {
             // Skip the timed lockouts so every guess is counted.
             db.conn.execute("UPDATE users SET locked_until = NULL", []).unwrap();
-            let r = db.authenticate("owner", &Credential::Pin(format!("{:04}", i))).unwrap();
+            let r = db.authenticate("owner", &Credential::Pin(format!("{:04}", i)), None).unwrap();
             assert!(r.is_err());
             // A remembered device still works while the account is locked.
-            assert!(db.authenticate("owner", &Credential::DeviceToken(tok.clone())).unwrap().is_ok());
-            assert!(db.authenticate("owner", &Credential::DeviceToken("0".repeat(64))).unwrap().is_err());
+            assert!(db.authenticate("owner", &Credential::DeviceToken(tok.clone()), None).unwrap().is_ok());
+            assert!(db.authenticate("owner", &Credential::DeviceToken("0".repeat(64)), None).unwrap().is_err());
         }
         db.conn.execute("UPDATE users SET locked_until = NULL", []).unwrap();
-        let r = db.authenticate("owner", &Credential::Pin("4821".into())).unwrap();
+        let r = db.authenticate("owner", &Credential::Pin("4821".into()), None).unwrap();
         assert!(matches!(r, Err(AuthError::PinDisabled)), "right PIN refused once switched off: {r:?}");
         db.set_pin("owner", Some("4821")).unwrap();
-        assert!(db.authenticate("owner", &Credential::Pin("4821".into())).unwrap().is_ok(), "setting it again re-enables it");
+        assert!(db.authenticate("owner", &Credential::Pin("4821".into()), None).unwrap().is_ok(), "setting it again re-enables it");
+
+        // Two-step sign-in: no code -> NeedCode (nothing checked); right code once only.
+        let secret = db.totp_begin("owner").unwrap();
+        let code = |step: u64| {
+            use hmac::Mac;
+            let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&secret).unwrap();
+            mac.update(&step.to_be_bytes());
+            let h = mac.finalize().into_bytes();
+            let off = (h[19] & 0x0f) as usize;
+            let bin = u32::from_be_bytes([h[off] & 0x7f, h[off + 1], h[off + 2], h[off + 3]]) % 1_000_000;
+            format!("{bin:06}")
+        };
+        let step = now() as u64 / 30;
+        db.totp_enable("owner", &code(step)).unwrap();
+        assert!(db.get_user("owner").unwrap().unwrap().has_totp);
+        assert!(matches!(db.authenticate("owner", &Credential::Pin("0000".into()), None).unwrap(), Err(AuthError::NeedCode)));
+        assert!(db.authenticate("owner", &Credential::Pin("4821".into()), Some(&code(step))).unwrap().is_err(), "code already used");
+        assert!(db.authenticate("owner", &Credential::Pin("4821".into()), Some(&code(step + 1))).unwrap().is_ok());
+        assert!(db.authenticate("owner", &Credential::Pin("9999".into()), Some(&code(step + 1))).unwrap().is_err());
+        assert!(db.authenticate("owner", &Credential::DeviceToken(tok.clone()), None).unwrap().is_ok(), "remembered devices skip the code");
+        db.totp_disable("owner").unwrap();
+        assert!(db.authenticate("owner", &Credential::Pin("4821".into()), None).unwrap().is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
