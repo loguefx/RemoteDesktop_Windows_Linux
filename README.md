@@ -459,3 +459,7 @@ Set `RUST_LOG=debug` for more detail.
   - **Testing so far:** the Wayland/PipeWire path builds and is unit-tested, but hasn't been run against a real GNOME or KDE session yet.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+
+## License
+
+MIT: see [LICENSE](LICENSE).
