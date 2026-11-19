@@ -158,6 +158,19 @@ struct SessionView {
     /// Gaming mode: pointer locked in the window, relative mouse, controllers forwarded.
     gaming: bool,
     pads: Option<pads::Forwarder>,
+    /// The remote computer's name, and its OS (`windows` / `linux`) when known.
+    host_name: String,
+    remote_os: Option<String>,
+    /// Show the picture at its actual size (1:1) instead of fitting it to the window.
+    actual_size: bool,
+    /// The part of the picture visible in the window (in actual size it can be scrolled).
+    image_clip: Option<egui::Rect>,
+    /// Connection details shown over the picture.
+    show_stats: bool,
+    /// A short message shown over the picture (screenshot saved, sound unavailable).
+    flash: Option<(String, Instant)>,
+    /// The host's status text, and when it last changed (shown for a few seconds).
+    status_seen: (String, Instant),
 }
 
 type AdminReply = oneshot::Receiver<Result<AdminResponse, String>>;
@@ -387,12 +400,17 @@ impl Gui {
                     let user = s.user.clone();
                     let s_control = user.effective().control;
                     let route = s.route.clone();
+                    let host_name = s.host_name.clone();
                     let ctx = self.ctx.clone();
                     let handle = session::Handle::start(&self.rt, s, move || ctx.request_repaint());
                     let store = Store::load();
                     handle.send(ClientMsg::SetCodec(store.video_codec()));
                     let lock_on_leave = store.lock_on_leave.unwrap_or(true);
                     handle.send(ClientMsg::LockOnLeave(lock_on_leave));
+                    let remote_os = match &attempt.target {
+                        Dest::Computer(k) => store.computers.get(k).and_then(|c| c.os.clone()),
+                        _ => None,
+                    };
                     self.screen = Screen::Session(Box::new(SessionView {
                         handle,
                         dest: attempt.target.clone(),
@@ -414,12 +432,19 @@ impl Gui {
                         chat_input: String::new(),
                         lock_on_leave,
                         shortcuts: store.system_shortcuts && s_control,
-                        fit: false,
+                        fit: store.fit_resolution && s_control,
                         fit_sent: None,
                         view_px: (0, 0),
                         view_changed: Instant::now(),
                         gaming: false,
                         pads: None,
+                        host_name,
+                        remote_os,
+                        actual_size: store.actual_size,
+                        image_clip: None,
+                        show_stats: store.show_stats,
+                        flash: None,
+                        status_seen: (String::new(), Instant::now()),
                     }));
                 }
                 Mode::Admin => {
@@ -611,7 +636,7 @@ impl Gui {
         let to_remote = |v: &SessionView, x: f64, y: f64| -> Option<(u32, u32)> {
             let r = v.image_rect?;
             let p = egui::pos2(x as f32 / ppp, y as f32 / ppp);
-            if !r.contains(p) || v.remote_size.0 == 0 {
+            if !r.contains(p) || !v.image_clip.is_none_or(|c| c.contains(p)) || v.remote_size.0 == 0 {
                 return None;
             }
             let rx = ((p.x - r.min.x) / r.width() * v.remote_size.0 as f32).clamp(0.0, v.remote_size.0 as f32 - 1.0);
@@ -663,7 +688,11 @@ impl Gui {
                 if !v.remote_focus || egui_wants_keyboard || !control {
                     return false;
                 }
-                if !event.repeat {
+                // Windows doesn't repeat a key that is held down by injected input, so a held
+                // key (Backspace, arrows) has to be repeated from here. Linux desktops repeat
+                // held keys themselves, and repeating them here too would double the rate.
+                let repeat_ok = v.remote_os.as_deref() == Some("windows") && event.state == ElementState::Pressed;
+                if !event.repeat || repeat_ok {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         if let Some(evdev) = keymap::evdev(code) {
                             v.handle.send(ClientMsg::Input(InputEvent::Key {
@@ -1070,6 +1099,9 @@ fn ago(unix: u64) -> String {
 
 /// A small Windows or Linux mark (drawn, so it doesn't depend on the font's symbols).
 fn os_icon(ui: &mut egui::Ui, os: Option<&str>) {
+    if !matches!(os, Some("windows" | "linux")) {
+        return; // no empty gap where the icon would be
+    }
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     let p = ui.painter();
     let c = rect.center();
@@ -1747,9 +1779,9 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
 
     if !v.fullscreen {
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12, 6)).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(14, 8)).stroke(egui::Stroke::new(1.0, theme::BORDER)))
             .show(ctx, |ui| {
-            if let Some(a) = toolbar(ui, v, &status, &displays, current, &viewers) {
+            if let Some(a) = toolbar(ui, v, &displays, current, &viewers) {
                 action = Some(a);
             }
         });
@@ -1765,10 +1797,17 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(screen.left() + 12.0, screen.top()))
                 .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_max_width(screen.width() - 40.0);
-                        toolbar(ui, v, &status, &displays, current, &viewers)
-                    })
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 })
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(140) })
+                        .show(ui, |ui| {
+                            // The bar's margins and border sit outside this width.
+                            ui.set_width(screen.width() - 24.0 - 26.0);
+                            toolbar(ui, v, &displays, current, &viewers)
+                        })
                     .inner
                 });
             if let Some(a) = r.inner {
@@ -1867,8 +1906,9 @@ fn chat_panel(ctx: &egui::Context, v: &mut SessionView) {
     });
 }
 
-/// "Direct · this network · 12 ms · 30 fps", with a coloured dot.
-fn connection_badge(ui: &mut egui::Ui, v: &SessionView) {
+/// "Direct · this network · 12 ms · 30 fps", with a coloured dot (`compact` leaves out
+/// the route; it's in the tooltip).
+fn connection_badge(ui: &mut egui::Ui, v: &SessionView, compact: bool) {
     let rtt = v.handle.state.lock().unwrap().rtt_ms;
     let (kind, color, help) = match v.route.as_str() {
         "direct" => ("Direct · this network", theme::SUCCESS, "Connected straight to the computer on your local network."),
@@ -1877,133 +1917,326 @@ fn connection_badge(ui: &mut egui::Ui, v: &SessionView) {
         "relayed (UDP)" => ("Relay (UDP)", theme::WARNING, "Carried by the relay server; a direct path wasn't possible."),
         _ => ("Relay", theme::WARNING, "Carried by the relay server over TCP; slower than a direct connection."),
     };
-    let mut text = kind.to_string();
-    if let Some(ms) = rtt {
-        text.push_str(&format!(" · {ms} ms"));
+    let mut parts = Vec::new();
+    if !compact {
+        parts.push(kind.to_string());
     }
-    text.push_str(&format!(" · {:.0} fps", v.fps.2));
-    theme::pill(ui, color, &text).on_hover_text(help);
+    match rtt {
+        Some(0) => parts.push("<1 ms".to_string()),
+        Some(ms) => parts.push(format!("{ms} ms")),
+        None => {}
+    }
+    // Nothing is sent while the remote screen is still, so "0 fps" would look broken.
+    if v.fps.2 >= 1.0 {
+        parts.push(format!("{:.0} fps", v.fps.2));
+    }
+    theme::pill(ui, color, &parts.join(" · ")).on_hover_text(format!("{kind}\n{help}"));
 }
 
-/// The session toolbar (top bar, or the slide-down bar in full screen).
+/// "Monitor 2 (main)": the name shown for a remote monitor. Windows calls them
+/// `\\.\DISPLAY1`, which says nothing, so they're numbered instead.
+fn monitor_label(d: &rd_core::proto::DisplayInfo) -> String {
+    if d.primary {
+        format!("Monitor {} (main)", d.index + 1)
+    } else {
+        format!("Monitor {}", d.index + 1)
+    }
+}
+
+/// A button that stays highlighted while its panel or feature is on.
+fn toggle(ui: &mut egui::Ui, on: bool, text: &str, help: &str) -> egui::Response {
+    ui.add(egui::Button::new(text).selected(on)).on_hover_text(help)
+}
+
+/// The session toolbar (top bar, or the slide-down bar in full screen): which computer
+/// and how it's connected on the left, the session's controls on the right, in one row.
 fn toolbar(
     ui: &mut egui::Ui,
     v: &mut SessionView,
-    status: &str,
     displays: &[rd_core::proto::DisplayInfo],
     current: u32,
     viewers: &[String],
 ) -> Option<SessionAction> {
     let mut action = None;
     let perms = v.user.effective();
-    ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&v.title).strong().color(Color32::WHITE));
-                connection_badge(ui, v);
+    // Below this width the monitor picker moves into the View menu only, and the
+    // connection badge drops the route, so the bar never wraps onto two rows.
+    let narrow = ui.available_width() < 1000.0;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        os_icon(ui, v.remote_os.as_deref());
+        ui.label(RichText::new(&v.host_name).size(15.5).strong().color(Color32::WHITE))
+            .on_hover_text(format!("Signed in as {}", v.user.username));
+        connection_badge(ui, v, narrow);
+        if !perms.control {
+            theme::pill(ui, theme::MUTED, "View only").on_hover_text("This account can watch but not use the keyboard and mouse");
+        }
+        if viewers.len() > 1 {
+            theme::pill(ui, theme::ACCENT, &format!("{} watching", viewers.len()))
+                .on_hover_text(format!("Connected to this computer right now:\n{}", viewers.join("\n")));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui.add(theme::danger("Disconnect")).on_hover_text("End the session").clicked() {
+                action = Some(SessionAction::Close);
+            }
+            if v.fullscreen {
+                if ui.button("Exit full screen").on_hover_text("Or press F11").clicked() {
+                    action = Some(SessionAction::Fullscreen(false));
+                }
+            } else if ui
+                .button("Full screen")
+                .on_hover_text("In full screen, touch the top edge of the screen for this bar; F11 leaves full screen")
+                .clicked()
+            {
+                action = Some(SessionAction::Fullscreen(true));
+            }
+            ui.menu_button("More", |ui| {
+                menu_style(ui);
+                more_menu(ui, v)
+            });
+            if perms.control {
+                ui.menu_button("Keys", |ui| {
+                    menu_style(ui);
+                    keys_menu(ui, v)
+                });
+            }
+            ui.menu_button("View", |ui| {
+                menu_style(ui);
+                view_menu(ui, v, displays, current)
+            });
+            ui.separator();
+            let unread = v.handle.state.lock().unwrap().chat_unread;
+            let chat_label = if unread > 0 && !v.show_chat { format!("Chat ({unread})") } else { "Chat".to_string() };
+            if toggle(ui, v.show_chat, &chat_label, "Chat with the person at the remote computer").clicked() {
+                v.show_chat = !v.show_chat;
+            }
+            if perms.files && toggle(ui, v.show_files, "Files", "Browse the remote computer's files, download and upload").clicked() {
+                v.show_files = !v.show_files;
+                if v.show_files && v.handle.state.lock().unwrap().dir.is_none() {
+                    v.handle.list_dir("");
+                }
+            }
+            if toggle(ui, v.audio_on, "Sound", "Play the remote computer's sound here").clicked() {
+                let want = !v.audio_on;
+                match v.handle.set_audio(want) {
+                    Ok(()) => v.audio_on = want,
+                    Err(e) => v.flash = Some((format!("Sound isn't available: {e:#}"), Instant::now())),
+                }
+            }
+            if !narrow && !displays.is_empty() {
                 ui.separator();
-                if !displays.is_empty() {
-                    let label = |d: &rd_core::proto::DisplayInfo| format!("{} {}x{}", d.name, d.width, d.height);
-                    let cur = displays.iter().find(|d| d.index == current).map(label).unwrap_or_default();
-                    ui.label(theme::hint("Monitor"));
-                    let why_not = if !perms.control {
-                        Some("Switching monitors needs control of the computer.")
-                    } else if displays.len() == 1 {
-                        Some(
-                            "Only one monitor is shared. On a Linux computer using Wayland, the screen-sharing \
-                             dialog there decides which monitors are shared: pick all of them the next time it asks.",
-                        )
-                    } else {
-                        None
-                    };
-                    ui.add_enabled_ui(why_not.is_none(), |ui| {
-                        egui::ComboBox::from_id_salt("display").selected_text(cur).show_ui(ui, |ui| {
-                            for d in displays {
-                                if ui.selectable_label(d.index == current, label(d)).clicked() {
-                                    v.handle.send(ClientMsg::SelectDisplay(d.index));
-                                }
-                            }
-                        });
-                    })
-                    .response
-                    .on_disabled_hover_text(why_not.unwrap_or_default());
-                }
-                {
-                    let (codec, kbps) = {
-                        let s = v.handle.state.lock().unwrap();
-                        (s.codec, s.kbps)
-                    };
-                    let smooth = matches!(codec, VideoCodec::H264 { .. });
-                    let label = |smooth: bool| if smooth { "Picture: smooth" } else { "Picture: sharp" };
-                    egui::ComboBox::from_id_salt("codec").selected_text(label(smooth)).show_ui(ui, |ui| {
-                        let choices = [
-                            (true, VideoCodec::H264 { max_kbps: 0 }, "Smooth (H.264): best for video and slow connections"),
-                            (false, VideoCodec::Tiles, "Sharp (lossless): pixel-exact, needs a fast connection"),
-                        ];
-                        for (is_smooth, c, text) in choices {
-                            if ui.selectable_label(smooth == is_smooth, text).clicked() && smooth != is_smooth {
-                                v.handle.send(ClientMsg::SetCodec(c));
-                                let mut store = Store::load();
-                                store.set_video_codec(c);
-                                let _ = store.save();
-                            }
-                        }
-                    });
-                    if smooth && kbps > 0 {
-                        ui.label(theme::hint(format!("{:.1} Mbit/s", kbps as f32 / 1000.0)))
-                            .on_hover_text("Current H.264 bitrate; it adapts to the connection");
-                    }
-                }
-                if perms.control && ui.button("Ctrl+Alt+Del").clicked() {
-                    v.handle.send(ClientMsg::SecureAttention);
-                }
-                let audio_label = if v.audio_on { "Sound: on" } else { "Sound: off" };
-                if ui.button(audio_label).clicked() {
-                    let want = !v.audio_on;
-                    match v.handle.set_audio(want) {
-                        Ok(()) => v.audio_on = want,
-                        Err(e) => v.handle.state.lock().unwrap().status = format!("audio unavailable: {e:#}"),
-                    }
-                }
-                if perms.files && ui.selectable_label(v.show_files, "Files").clicked() {
-                    v.show_files = !v.show_files;
-                    if v.show_files && v.handle.state.lock().unwrap().dir.is_none() {
-                        v.handle.list_dir("");
-                    }
-                }
-                let unread = v.handle.state.lock().unwrap().chat_unread;
-                let chat_label = if unread > 0 && !v.show_chat { format!("Chat ({unread})") } else { "Chat".to_string() };
-                if ui.selectable_label(v.show_chat, chat_label).clicked() {
-                    v.show_chat = !v.show_chat;
-                }
-                ui.menu_button("More", |ui| more_menu(ui, v));
-                if v.fullscreen {
-                    if ui.button("Leave full screen").on_hover_text("Or press F11").clicked() {
-                        action = Some(SessionAction::Fullscreen(false));
-                    }
-                } else if ui.button("Full screen").on_hover_text("Move the pointer to the top edge for this toolbar; F11 leaves full screen").clicked() {
-                    action = Some(SessionAction::Fullscreen(true));
-                }
-                if ui.add(theme::danger("Disconnect")).clicked() {
-                    action = Some(SessionAction::Close);
-                }
-                if !status.is_empty() {
-                    ui.separator();
-                    ui.label(theme::hint(status));
-                }
-                if viewers.len() > 1 {
-                    ui.label(theme::hint(format!("Connected: {}", viewers.join(", "))))
-                        .on_hover_text("Everyone connected to this computer right now");
-                }
+                monitor_picker(ui, v, displays, current);
+            }
+        });
     });
     action
 }
 
-/// Session options: lock on leave, privacy screen, shortcuts, fit, gaming mode.
+/// egui's menus drop the outline of unticked boxes and radio buttons, which leaves them
+/// almost invisible on the dark menu; a lighter fill keeps them visible. Tighter corners
+/// keep tick boxes square, so they don't look like the round choices next to them.
+fn menu_style(ui: &mut egui::Ui) {
+    let w = &mut ui.visuals_mut().widgets;
+    w.inactive.bg_fill = Color32::from_rgb(62, 68, 82);
+    w.hovered.bg_fill = Color32::from_rgb(78, 85, 102);
+    for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+        s.corner_radius = egui::CornerRadius::same(4);
+    }
+}
+
+/// Why the monitor can't be switched right now, if it can't.
+fn monitor_switch_blocked(v: &SessionView, displays: &[rd_core::proto::DisplayInfo]) -> Option<&'static str> {
+    if !v.user.effective().control {
+        Some("Switching monitors needs control of the computer.")
+    } else if displays.len() == 1 {
+        Some(if v.remote_os.as_deref() == Some("windows") {
+            "The remote computer has one monitor."
+        } else {
+            "Only one monitor is shared. On a Linux computer using Wayland, the screen-sharing \
+             dialog there decides which monitors are shared: pick all of them the next time it asks."
+        })
+    } else {
+        None
+    }
+}
+
+fn monitor_picker(ui: &mut egui::Ui, v: &mut SessionView, displays: &[rd_core::proto::DisplayInfo], current: u32) {
+    let cur = displays.iter().find(|d| d.index == current).map(monitor_label).unwrap_or_default();
+    let why_not = monitor_switch_blocked(v, displays);
+    ui.add_enabled_ui(why_not.is_none(), |ui| {
+        egui::ComboBox::from_id_salt("display").selected_text(cur).show_ui(ui, |ui| {
+            ui.set_min_width(220.0);
+            for d in displays {
+                let text = format!("{}  ·  {}×{}", monitor_label(d), d.width, d.height);
+                if ui.selectable_label(d.index == current, text).clicked() && d.index != current {
+                    v.handle.send(ClientMsg::SelectDisplay(d.index));
+                }
+            }
+        });
+    })
+    .response
+    .on_hover_text("Which of the remote computer's monitors to show")
+    .on_disabled_hover_text(why_not.unwrap_or_default());
+}
+
+/// How the picture is shown: monitor, size, quality, resolution, details.
+fn view_menu(ui: &mut egui::Ui, v: &mut SessionView, displays: &[rd_core::proto::DisplayInfo], current: u32) {
+    ui.set_min_width(300.0);
+    let control = v.user.effective().control;
+    if !displays.is_empty() {
+        ui.label(theme::hint("Monitor"));
+        match monitor_switch_blocked(v, displays) {
+            Some(why) if displays.len() == 1 || !control => {
+                if let Some(d) = displays.first() {
+                    ui.label(format!("{}  ·  {}×{}", monitor_label(d), d.width, d.height));
+                }
+                ui.add(egui::Label::new(theme::hint(why)).wrap());
+            }
+            _ => {
+                for d in displays {
+                    let text = format!("{}  ·  {}×{}", monitor_label(d), d.width, d.height);
+                    if ui.radio(d.index == current, text).clicked() && d.index != current {
+                        v.handle.send(ClientMsg::SelectDisplay(d.index));
+                    }
+                }
+            }
+        }
+        ui.separator();
+    }
+
+    ui.label(theme::hint("Picture size"));
+    let was = v.actual_size;
+    if ui.radio(!v.actual_size, "Fit to the window").clicked() {
+        v.actual_size = false;
+    }
+    if ui
+        .radio(v.actual_size, "Actual size")
+        .on_hover_text("One remote pixel per screen pixel, the sharpest; drag the scroll bars to move around (the mouse wheel goes to the remote computer)")
+        .clicked()
+    {
+        v.actual_size = true;
+    }
+    if v.actual_size != was {
+        let mut store = Store::load();
+        store.actual_size = v.actual_size;
+        let _ = store.save();
+    }
+    if control
+        && ui
+            .checkbox(&mut v.fit, "Change its resolution to fit this window")
+            .on_hover_text("Switch the remote screen to the resolution closest to this window, for sharp text; it's put back when you disconnect")
+            .changed()
+    {
+        v.fit_sent = None;
+        v.view_changed = Instant::now() - Duration::from_secs(1);
+        if !v.fit {
+            v.handle.send(ClientMsg::FitResolution(None));
+        }
+        let mut store = Store::load();
+        store.fit_resolution = v.fit;
+        let _ = store.save();
+    }
+    ui.separator();
+
+    ui.label(theme::hint("Picture quality"));
+    let (codec, kbps) = {
+        let s = v.handle.state.lock().unwrap();
+        (s.codec, s.kbps)
+    };
+    let smooth = matches!(codec, VideoCodec::H264 { .. });
+    let choices = [
+        (true, VideoCodec::H264 { max_kbps: 0 }, "Smooth", "Best for video, games and slower connections"),
+        (false, VideoCodec::Tiles, "Sharp", "Pixel-exact text and images; needs a fast connection"),
+    ];
+    for (is_smooth, c, text, help) in choices {
+        if ui.radio(smooth == is_smooth, text).on_hover_text(help).clicked() && smooth != is_smooth {
+            v.handle.send(ClientMsg::SetCodec(c));
+            let mut store = Store::load();
+            store.set_video_codec(c);
+            let _ = store.save();
+        }
+    }
+    if smooth && kbps > 0 {
+        ui.label(theme::hint(format!("Now {:.1} Mbit/s; it adapts to the connection.", kbps as f32 / 1000.0)));
+    }
+    ui.separator();
+    if ui.checkbox(&mut v.show_stats, "Show connection details").on_hover_text("Speed, delay and picture size over the picture").changed() {
+        let mut store = Store::load();
+        store.show_stats = v.show_stats;
+        let _ = store.save();
+    }
+}
+
+/// Press and release a key combination on the remote computer (evdev codes, held in
+/// order and let go in reverse).
+fn send_keys(v: &SessionView, codes: &[u16]) {
+    for &code in codes {
+        v.handle.send(ClientMsg::Input(InputEvent::Key { code, down: true }));
+    }
+    for &code in codes.iter().rev() {
+        v.handle.send(ClientMsg::Input(InputEvent::Key { code, down: false }));
+    }
+}
+
+/// Keys this computer would catch itself, and how the keyboard and mouse are sent.
+fn keys_menu(ui: &mut egui::Ui, v: &mut SessionView) {
+    ui.set_min_width(260.0);
+    ui.label(theme::hint("Send to the remote computer"));
+    if ui.button("Ctrl+Alt+Del").clicked() {
+        v.handle.send(ClientMsg::SecureAttention);
+        ui.close_menu();
+    }
+    let super_key = if v.remote_os.as_deref() == Some("linux") { "Super key" } else { "Windows key" };
+    // evdev: LEFTMETA 125, LEFTALT 56, TAB 15, F4 62, SYSRQ (Print Screen) 99, LEFTCTRL 29, ESC 1.
+    let combos: [(&str, &[u16]); 5] = [
+        (super_key, &[125]),
+        ("Alt+Tab", &[56, 15]),
+        ("Alt+F4", &[56, 62]),
+        ("Ctrl+Esc", &[29, 1]),
+        ("Print Screen", &[99]),
+    ];
+    for (label, codes) in combos {
+        if ui.button(label).clicked() {
+            send_keys(v, codes);
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    if ui
+        .checkbox(&mut v.shortcuts, "Send system shortcuts")
+        .on_hover_text("The Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote computer instead of this one")
+        .changed()
+    {
+        let mut store = Store::load();
+        store.system_shortcuts = v.shortcuts;
+        let _ = store.save();
+    }
+    let was = v.gaming;
+    ui.checkbox(&mut v.gaming, "Gaming mode")
+        .on_hover_text("Locks the pointer in the window and sends raw mouse movement and game controllers. Press Ctrl+Alt+G to leave.");
+    if v.gaming != was {
+        v.pads = v.gaming.then(|| pads::start(v.handle.sender()));
+        if v.gaming {
+            v.flash = Some(("Gaming mode: press Ctrl+Alt+G to get the pointer back".into(), Instant::now()));
+            ui.close_menu();
+        }
+    }
+}
+
+/// Session options: lock on leave, privacy screen, screenshot.
 fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
+    ui.set_min_width(280.0);
     let control = v.user.effective().control;
     let (privacy, note) = {
         let s = v.handle.state.lock().unwrap();
         (s.privacy, s.privacy_note.clone())
     };
+    if ui.button("Save a screenshot...").on_hover_text("Save what you see of the remote computer as a PNG picture").clicked() {
+        ui.close_menu();
+        v.flash = Some((save_screenshot(v), Instant::now()));
+    }
+    ui.separator();
     if ui.checkbox(&mut v.lock_on_leave, "Lock the computer when I disconnect").changed() {
         v.handle.send(ClientMsg::LockOnLeave(v.lock_on_leave));
         let mut store = Store::load();
@@ -2011,7 +2244,7 @@ fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
         let _ = store.save();
     }
     if !control {
-        ui.label(theme::hint("The other options need control of the computer."));
+        ui.label(theme::hint("The privacy screen needs control of the computer."));
         return;
     }
     let mut p = privacy;
@@ -2023,41 +2256,37 @@ fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
         v.handle.send(ClientMsg::Privacy(p));
     }
     if let Some(n) = note {
-        ui.label(RichText::new(n).small().color(theme::WARNING));
-    }
-    if ui
-        .checkbox(&mut v.shortcuts, "Send system shortcuts")
-        .on_hover_text("The Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote computer instead of this one")
-        .changed()
-    {
-        let mut store = Store::load();
-        store.system_shortcuts = v.shortcuts;
-        let _ = store.save();
-    }
-    if ui
-        .checkbox(&mut v.fit, "Fit its resolution to this window")
-        .on_hover_text("Switch the remote screen to the resolution closest to this window, for sharp text; it's put back when you disconnect")
-        .changed()
-    {
-        v.fit_sent = None;
-        v.view_changed = Instant::now() - Duration::from_secs(1);
-        if !v.fit {
-            v.handle.send(ClientMsg::FitResolution(None));
-        }
-    }
-    let was = v.gaming;
-    ui.checkbox(&mut v.gaming, "Gaming mode")
-        .on_hover_text("Locks the pointer in the window and sends raw mouse movement and game controllers. Press Ctrl+Alt+G to leave.");
-    if v.gaming != was {
-        v.pads = v.gaming.then(|| pads::start(v.handle.sender()));
-        if v.gaming {
-            ui.close_menu();
-        }
+        ui.add(egui::Label::new(RichText::new(n).small().color(theme::WARNING)).wrap());
     }
 }
 
-/// The remote picture, filling the rest of the window.
+/// Save the current remote picture as a PNG the user picks; returns what happened.
+fn save_screenshot(v: &SessionView) -> String {
+    let (w, h, rgba) = {
+        let s = v.handle.state.lock().unwrap();
+        let (w, h) = (s.decoder.width, s.decoder.height);
+        let rgba: Vec<u8> = s.decoder.pixels.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
+        (w, h, rgba)
+    };
+    if w == 0 || h == 0 {
+        return "There's no picture yet to save.".into();
+    }
+    let safe: String = v.host_name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let Some(path) = rfd::FileDialog::new().set_file_name(format!("{safe}-{stamp}.png")).add_filter("PNG picture", &["png"]).save_file() else {
+        return "Screenshot not saved.".into();
+    };
+    match clipboard::encode_png(w, h, &rgba).map_err(|e| format!("{e:#}")).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
+        Ok(()) => format!("Screenshot saved to {}", path.display()),
+        Err(e) => format!("Couldn't save the screenshot: {e}"),
+    }
+}
+
+/// The remote picture, filling the rest of the window: fitted to it, or at its actual
+/// size with scroll bars. Connection details and short messages float over it.
 fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
+    // Mipmaps keep text readable when a large screen is shown smaller than it is.
+    let tex_opts = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
     // Upload changed regions of the remote framebuffer into the texture.
     {
         let mut s = v.handle.state.lock().unwrap();
@@ -2068,8 +2297,8 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
             if need_full {
                 let img = ColorImage { size: [w, h], pixels: s.decoder.pixels.iter().map(|p| to_color(*p)).collect() };
                 match &mut v.texture {
-                    Some(t) => t.set(img, TextureOptions::LINEAR),
-                    None => v.texture = Some(ctx.load_texture("remote", img, TextureOptions::LINEAR)),
+                    Some(t) => t.set(img, tex_opts),
+                    None => v.texture = Some(ctx.load_texture("remote", img, tex_opts)),
                 }
                 v.remote_size = (w as u32, h as u32);
                 s.full_dirty = false;
@@ -2081,13 +2310,14 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
                     for row in y..y + th {
                         px.extend(s.decoder.pixels[row * w + x..row * w + x + tw].iter().map(|p| to_color(*p)));
                     }
-                    tex.set_partial([x, y], ColorImage { size: [tw, th], pixels: px }, TextureOptions::LINEAR);
+                    tex.set_partial([x, y], ColorImage { size: [tw, th], pixels: px }, tex_opts);
                 }
             }
         }
     }
 
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_rgb(12, 13, 16))).show(ctx, |ui| {
+    let backdrop = Color32::from_rgb(12, 13, 16);
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ctx, |ui| {
         let avail = ui.available_rect_before_wrap();
         let ppp = ctx.pixels_per_point();
         let px = ((avail.width() * ppp) as u32, (avail.height() * ppp) as u32);
@@ -2095,32 +2325,149 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
             v.view_px = px;
             v.view_changed = Instant::now();
         }
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         match &v.texture {
             Some(tex) if v.remote_size.0 > 0 => {
                 let (rw, rh) = (v.remote_size.0 as f32, v.remote_size.1 as f32);
-                let scale = (avail.width() / rw).min(avail.height() / rh);
-                let size = egui::vec2(rw * scale, rh * scale);
-                let rect = egui::Rect::from_center_size(avail.center(), size);
-                ui.painter().image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                v.image_rect = Some(rect);
+                let tex_id = tex.id();
+                if v.actual_size {
+                    // One remote pixel per physical pixel; scroll bars when it doesn't fit.
+                    let size = egui::vec2(rw / ppp, rh / ppp);
+                    // Solid scroll bars beside the picture, not floating over it, so a click on
+                    // them never reaches the remote computer.
+                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                    let out = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("picture").show(ui, |ui| {
+                        let free = ui.available_size();
+                        // Centre it while it's smaller than the window.
+                        let pad = egui::vec2(((free.x - size.x) / 2.0).max(0.0), ((free.y - size.y) / 2.0).max(0.0));
+                        let (outer, _) = ui.allocate_exact_size(size + pad * 2.0, egui::Sense::hover());
+                        let rect = egui::Rect::from_min_size(outer.min + pad, size);
+                        ui.painter().image(tex_id, rect, uv, Color32::WHITE);
+                        rect
+                    });
+                    v.image_rect = Some(out.inner);
+                    v.image_clip = Some(out.inner_rect);
+                } else {
+                    let scale = (avail.width() / rw).min(avail.height() / rh);
+                    // Snap to whole physical pixels so the picture isn't blurred by half-pixel offsets.
+                    let size = egui::vec2((rw * scale * ppp).floor() / ppp, (rh * scale * ppp).floor() / ppp);
+                    let min = ((avail.center() - size / 2.0) * ppp).round() / ppp;
+                    let rect = egui::Rect::from_min_size(min, size);
+                    ui.painter().image(tex_id, rect, uv, Color32::WHITE);
+                    v.image_rect = Some(rect);
+                    v.image_clip = Some(avail);
+                }
+                let clip = v.image_clip.unwrap_or(avail);
                 // Not while over the slide-down toolbar, a menu or a toast: clicks there are ours.
-                v.remote_hover = ctx.pointer_latest_pos().is_some_and(|p| rect.contains(p)) && !ctx.is_pointer_over_area();
+                v.remote_hover = ctx
+                    .pointer_latest_pos()
+                    .is_some_and(|p| v.image_rect.is_some_and(|r| r.contains(p)) && clip.contains(p))
+                    && !ctx.is_pointer_over_area();
             }
             _ => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space((ui.available_height() / 2.0 - 30.0).max(0.0));
-                    ui.add(egui::Spinner::new().size(28.0).color(theme::ACCENT));
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(status).color(theme::MUTED));
+                    ui.add_space((ui.available_height() / 2.0 - 40.0).max(0.0));
+                    ui.add(egui::Spinner::new().size(32.0).color(theme::ACCENT));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(format!("Connecting to {}", v.host_name)).size(16.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(friendly_status(status, &v.host_name)).color(theme::MUTED));
                 });
             }
         }
+        picture_overlays(ui, v, avail, status);
     });
+}
+
+/// Connection details (top right) and short messages (bottom centre) over the picture.
+fn picture_overlays(ui: &mut egui::Ui, v: &mut SessionView, area: egui::Rect, status: &str) {
+    let chip = |ui: &mut egui::Ui, pos: egui::Align2, at: egui::Pos2, lines: &[(String, Color32)]| {
+        let font = egui::FontId::proportional(12.5);
+        let galleys: Vec<_> = lines.iter().map(|(t, c)| ui.painter().layout_no_wrap(t.clone(), font.clone(), *c)).collect();
+        let w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        let h: f32 = galleys.iter().map(|g| g.size().y + 2.0).sum();
+        let rect = pos.anchor_size(at, egui::vec2(w + 20.0, h + 12.0));
+        ui.painter().rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(14, 16, 20, 225));
+        ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        let mut y = rect.top() + 6.0;
+        for g in galleys {
+            let gh = g.size().y;
+            ui.painter().galley(egui::pos2(rect.left() + 10.0, y), g, Color32::WHITE);
+            y += gh + 2.0;
+        }
+    };
+
+    if v.show_stats && v.remote_size.0 > 0 {
+        let (rtt, codec, kbps) = {
+            let s = v.handle.state.lock().unwrap();
+            (s.rtt_ms, s.codec, s.kbps)
+        };
+        let mut lines = vec![
+            (format!("{}×{}  ·  {:.0} fps", v.remote_size.0, v.remote_size.1, v.fps.2), Color32::WHITE),
+            (
+                match codec {
+                    VideoCodec::H264 { .. } if kbps > 0 => format!("Smooth (H.264)  ·  {:.1} Mbit/s", kbps as f32 / 1000.0),
+                    VideoCodec::H264 { .. } => "Smooth (H.264)".to_string(),
+                    VideoCodec::Tiles => "Sharp (lossless)".to_string(),
+                },
+                theme::TEXT,
+            ),
+            (format!("{}{}", route_name(&v.route), rtt.map(|ms| format!("  ·  {ms} ms")).unwrap_or_default()), theme::TEXT),
+        ];
+        if !status.is_empty() {
+            lines.push((status.to_string(), theme::MUTED)); // the raw text, with the capture method
+        }
+        chip(ui, egui::Align2::RIGHT_TOP, area.right_top() + egui::vec2(-12.0, 12.0), &lines);
+    }
+
+    // A changed status from the host ("connected (x11)", a resolution note) shows for a few seconds.
+    if status != v.status_seen.0 {
+        v.status_seen = (status.to_string(), Instant::now());
+        // Connected by address rather than from the list, the OS isn't known yet; the
+        // capture backend in "connected (windows)" tells it (key repeat depends on it).
+        if v.remote_os.is_none() {
+            v.remote_os = match status.strip_prefix("connected (").and_then(|b| b.strip_suffix(')')) {
+                Some("windows") => Some("windows".into()),
+                Some("x11" | "wayland") => Some("linux".into()),
+                _ => None,
+            };
+        }
+    }
+    let msg = match &v.flash {
+        Some((m, t)) if t.elapsed() < Duration::from_secs(6) => Some(m.clone()),
+        _ => {
+            v.flash = None;
+            (v.remote_size.0 > 0 && !status.is_empty() && v.status_seen.1.elapsed() < Duration::from_secs(4))
+                .then(|| friendly_status(status, &v.host_name))
+        }
+    };
+    if let Some(m) = msg {
+        chip(ui, egui::Align2::CENTER_BOTTOM, area.center_bottom() - egui::vec2(0.0, 20.0), &[(m, Color32::WHITE)]);
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    }
+}
+
+/// The host's status for people: "connected (wgc)" names the capture method, which
+/// only matters in the connection details.
+fn friendly_status(status: &str, host: &str) -> String {
+    if status.starts_with("connected") {
+        return format!("Connected to {host}");
+    }
+    let mut c = status.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// "Direct · this network" and the like, for a connection route.
+fn route_name(route: &str) -> &'static str {
+    match route {
+        "direct" => "Direct · this network",
+        "over the internet" => "Direct · internet",
+        "peer-to-peer" => "Peer-to-peer",
+        "relayed (UDP)" => "Relay (UDP)",
+        _ => "Relay",
+    }
 }
 
 fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
@@ -2711,7 +3058,7 @@ impl App {
             if let Err(e) = keyhook::set(window, if shortcuts { sender } else { None }) {
                 if let Screen::Session(v) = &mut gui.screen {
                     v.shortcuts = false;
-                    v.handle.state.lock().unwrap().status = format!("System shortcuts: {e}");
+                    v.flash = Some((format!("System shortcuts unavailable: {e}"), Instant::now()));
                 }
                 self.shortcuts_on = false;
             }

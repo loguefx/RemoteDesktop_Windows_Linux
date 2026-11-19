@@ -26,6 +26,16 @@ pub struct Store {
     /// Send system shortcuts (Windows key, Alt+Tab...) to the remote computer.
     #[serde(default)]
     pub system_shortcuts: bool,
+    /// Show the remote screen at its actual size (1:1, scroll to pan) instead of fitting
+    /// it to the window.
+    #[serde(default)]
+    pub actual_size: bool,
+    /// Show the connection details over the picture.
+    #[serde(default)]
+    pub show_stats: bool,
+    /// Change the remote resolution to fit this window.
+    #[serde(default)]
+    pub fit_resolution: bool,
 }
 
 /// A computer in "My computers": how to find it and how to sign in.

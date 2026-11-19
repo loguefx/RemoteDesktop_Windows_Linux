@@ -13,8 +13,9 @@ A Chrome-Remote-Desktop-style remote access tool written in Rust.
   - the remote screen with a toolbar (it slides down from the top edge in full screen) and a
     connection badge: direct or relay, round-trip time, frames per second
   - **Wake up** for sleeping computers (Wake-on-LAN), **rename on this device**, last-connected times
-  - a file panel, chat, and a **More** menu: lock on disconnect, privacy screen, system
-    shortcuts, fit the resolution to the window, gaming mode (controllers too)
+  - a file panel, chat, and **View**, **Keys** and **More** menus: monitor, picture size and
+    quality, fit the resolution to the window, connection details, special keys, system
+    shortcuts, gaming mode (controllers too), screenshots, lock on disconnect, privacy screen
   - an accounts screen, with two-step sign-in (authenticator app codes)
   - **Update now** when a new release is out
   - a CLI for scripting
@@ -229,17 +230,37 @@ In a session:
 
 - **Mouse and keyboard** go to the remote computer while the pointer is over the picture. Physical keys are sent, so the remote keyboard layout applies.
 - **Pointer:** over the picture your pointer takes the remote computer's shape (text I-beam, hand, resize arrows, hidden), scaled with the picture. Windows and X11 hosts send the shape; on Wayland the desktop draws the pointer into the picture, so your own pointer is hidden there instead.
-- **Toolbar:**
-  - **Picture** mode:
-    - **Smooth** (H.264, the default) is best for video, scrolling and slow connections. The current bitrate is shown next to it.
-    - **Sharp** sends lossless tiles only: pixel-exact, but it needs a fast link (roughly 10+ Mbit/s while the screen moves).
-    - The choice is remembered.
-  - display picker (with more than one monitor)
-  - **Ctrl+Alt+Del**
-  - **Sound** on/off
-  - **Files**
-  - **Chat** with the person at the remote computer (and anyone else connected); unread messages are counted
+- **Toolbar** (one row: the computer and its connection on the left, controls on the right):
+  - **Connection badge:** *Direct · this network*, *Direct · internet*, *Peer-to-peer* or *Relay*,
+    with the round-trip time and frames per second. *View only* and the number of people watching
+    show next to it when they apply.
+  - **Monitor** picker: which remote monitor to show. It's greyed out, with the reason when you
+    point at it, if only one monitor is shared or the account can't control the computer.
+  - **Sound**, **Files** and **Chat** (with the person at the remote computer and anyone else
+    connected; unread messages are counted). Each stays highlighted while it's on.
+  - **View:**
+    - **Monitor** (also here when the window is too narrow for the picker).
+    - **Picture size:** *Fit to the window*, or *Actual size* (one remote pixel per screen pixel,
+      with scroll bars). Remembered.
+    - **Change its resolution to fit this window:** the remote screen switches to its largest
+      resolution that fits your window, for sharp, unscaled text. The original comes back when you
+      disconnect. Windows and X11 (the modes the monitor offers); not on Wayland. Remembered.
+    - **Picture quality:** *Smooth* (H.264, the default) is best for video, scrolling and slow
+      connections; *Sharp* sends lossless tiles only: pixel-exact, but it needs a fast link
+      (roughly 10+ Mbit/s while the screen moves). The current bitrate is shown. Remembered.
+    - **Show connection details:** picture size, frame rate, quality, bitrate, route and delay over
+      the corner of the picture. Remembered.
+  - **Keys** (with control of the computer):
+    - **Ctrl+Alt+Del**, the **Windows / Super key**, **Alt+Tab**, **Alt+F4**, **Ctrl+Esc** and
+      **Print Screen**, sent once.
+    - **Send system shortcuts:** the Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote
+      computer instead of yours (Windows and X11; Wayland desktops don't allow it).
+    - **Gaming mode:** the pointer is locked in the window and raw mouse movement is sent, as games
+      expect. Game controllers plugged into your computer appear on the remote one as Xbox
+      controllers (Windows hosts need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)
+      driver; Linux hosts use uinput). **Ctrl+Alt+G** leaves gaming mode.
   - **More:**
+    - **Save a screenshot...** of the remote screen as a PNG.
     - **Lock the computer when I disconnect** (on by default; remembered). When the last viewer
       leaves, the remote computer locks, so nobody there can use your signed-in desktop. It doesn't
       lock when the person at the computer pressed *Disconnect*.
@@ -248,20 +269,10 @@ In a session:
       that screen capture leaves out, so you still see the desktop; Ctrl+Alt+Del on that computer
       always gives control back. On X11 the monitor is switched off (DPMS); remote input wakes it
       briefly. Not available on Wayland.
-    - **Send system shortcuts:** the Windows key, Alt+Tab, Alt+F4 and Ctrl+Esc go to the remote
-      computer instead of yours (Windows and X11; Wayland desktops don't allow it).
-    - **Fit its resolution to this window:** the remote screen switches to its largest resolution
-      that fits your window, for sharp, unscaled text. The original comes back when you disconnect.
-      Windows and X11 (the modes the monitor offers); not on Wayland.
-    - **Gaming mode:** the pointer is locked in the window and raw mouse movement is sent, as games
-      expect. Game controllers plugged into your computer appear on the remote one as Xbox
-      controllers (Windows hosts need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)
-      driver; Linux hosts use uinput). **Ctrl+Alt+G** leaves gaming mode.
-  - **Full screen**: move the pointer to the top edge to bring the toolbar back; F11 leaves
+  - **Full screen**: move the pointer to the top edge to bring the toolbar back; F11 leaves.
   - **Disconnect**
-  - who else is connected
-  - **Connection badge:** *Direct · this network*, *Direct · internet*, *Peer-to-peer* or *Relay*,
-    with the round-trip time and frames per second
+- **Held keys repeat** on Windows computers too (Windows doesn't repeat keys held by remote input,
+  so the app repeats them; Linux desktops repeat them themselves).
 - **Session ended:** *Reconnect* tries again with the saved sign-in (for example after the remote
   computer went from its login screen to the desktop).
 - **Clipboard:** text and images (screenshots, copied pictures) sync both ways automatically, if your account has the clipboard permission: Ctrl+C on one computer, Ctrl+V on the other. On Linux it works on X11 and on Wayland desktops that offer clipboard access to other programs (KDE Plasma, wlroots-based desktops such as Sway or Hyprland); elsewhere, such as GNOME, it goes through XWayland, which may only work while an X11 app has focus. Images up to 8K resolution are sent as PNG.
