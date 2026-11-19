@@ -460,6 +460,16 @@ Set `RUST_LOG=debug` for more detail.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 
+## Code signing (optional)
+
+Unsigned Windows downloads make SmartScreen warn "Windows protected your PC" (*More info* →
+*Run anyway*). The GitHub build signs the programs and the installer with
+[Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/) when these repository
+secrets are set: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (an app registration with
+the *Trusted Signing Certificate Profile Signer* role), `TRUSTED_SIGNING_ENDPOINT`,
+`TRUSTED_SIGNING_ACCOUNT` and `TRUSTED_SIGNING_PROFILE`. Without them it builds unsigned, as before.
+See [packaging/windows/sign.ps1](packaging/windows/sign.ps1).
+
 ## License
 
 MIT: see [LICENSE](LICENSE).

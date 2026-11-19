@@ -20,6 +20,15 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
+    # Code signing (Azure Trusted Signing) happens only when these secrets are set;
+    # see packaging/windows/sign.ps1. Without them the programs are built unsigned.
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,6 +37,10 @@ jobs:
         run: cargo test --release --workspace
       - name: Build
         run: cargo build --release --workspace
+      - name: Sign the programs
+        if: ${{ env.AZURE_CLIENT_ID != '' && github.event_name != 'pull_request' }}
+        shell: pwsh
+        run: packaging/windows/sign.ps1 target/release/rd-client.exe target/release/rd-host.exe target/release/rd-relay.exe
       - name: Package
         shell: pwsh
         run: |
@@ -39,6 +52,8 @@ jobs:
           $setup = "dist/RD-Remote-Desktop-Setup-windows-x64.exe"
           Start-Process -Wait -NoNewWindow -FilePath target/release/rd-client.exe -ArgumentList "make-installer", "--host", "target/release/rd-host.exe", $setup
           if (-not (Test-Path $setup)) { throw "installer not made" }
+          # The installer is signed too (it finds its contents before the signature).
+          if ($env:AZURE_CLIENT_ID -and $env:GITHUB_EVENT_NAME -ne 'pull_request') { packaging/windows/sign.ps1 $setup }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
