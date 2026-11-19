@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use rd_core::audio::AudioChunk;
 use rd_core::codec::{EncodedFrame, Tile, TILE};
-use rd_core::framing::{read_msg, write_msg};
+use rd_core::framing::{read_msg, read_msg_max, write_msg, MAX_HELLO};
 use rd_core::proto::*;
 use rd_core::tls::TlsAcceptor;
 use rd_core::PROTOCOL_VERSION;
@@ -245,7 +245,7 @@ pub(crate) async fn session<S>(shared: Arc<Shared>, mut tls: S, peer: String, ip
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let hello: ClientHello = tokio::time::timeout(Duration::from_secs(60), read_msg(&mut tls))
+    let hello: ClientHello = tokio::time::timeout(Duration::from_secs(60), read_msg_max(&mut tls, MAX_HELLO))
         .await
         .map_err(|_| anyhow!("login timeout"))??;
 
@@ -351,6 +351,10 @@ fn ip_blocked(shared: &Shared, ip: IpAddr) -> bool {
 
 fn note_failure(shared: &Shared, ip: IpAddr) {
     let mut f = shared.failures.lock().unwrap();
+    // Forget old entries now and then, so addresses that stopped trying don't pile up.
+    if f.len() > 10_000 {
+        f.retain(|_, (_, start)| start.elapsed() < IP_WINDOW);
+    }
     let e = f.entry(ip).or_insert((0, Instant::now()));
     if e.1.elapsed() >= IP_WINDOW {
         *e = (0, Instant::now());
@@ -737,7 +741,7 @@ async fn accept_agent(listener: &TcpListener, token: &str) -> Result<TcpStream> 
         if !peer.ip().is_loopback() {
             continue;
         }
-        let hello: AgentHello = match tokio::time::timeout(Duration::from_secs(5), read_msg(&mut s)).await {
+        let hello: AgentHello = match tokio::time::timeout(Duration::from_secs(5), read_msg_max(&mut s, MAX_HELLO)).await {
             Ok(Ok(h)) => h,
             _ => continue,
         };

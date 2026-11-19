@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use rd_core::framing::{read_msg, write_msg};
+use rd_core::framing::{read_msg_max, write_msg, MAX_HELLO};
 use rd_core::relay::{
     allocation_id, parse_udp_relay_header, probe_reply, RelayHello, RelayNotice, RelayReply, DEFAULT_RELAY_PORT,
     MAX_CANDIDATES, RELAY_VERSION, ROLE_HOST,
@@ -67,6 +67,8 @@ struct Alloc {
     label: String,
 }
 
+/// Most host ids the relay will hold claims for (each claim rewrites the state file).
+const MAX_CLAIMS: usize = 100_000;
 /// Most UDP relay allocations at once.
 const MAX_ALLOCS: usize = 10_000;
 /// An allocation with no traffic for this long is dropped.
@@ -87,6 +89,10 @@ struct Relay {
     rate: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     generation: Mutex<u64>,
     allocs: Mutex<HashMap<[u8; 16], Alloc>>,
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn sha(s: &str) -> String {
@@ -110,8 +116,8 @@ impl Relay {
         }
     }
 
-    /// Check (or claim) `id` with `secret`.
-    fn verify_host(&self, id: &str, secret: &str) -> Result<()> {
+    /// Check (or, with `may_claim`, claim) `id` with `secret`.
+    fn verify_host(&self, id: &str, secret: &str, may_claim: bool) -> Result<()> {
         if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             bail!("invalid host id");
         }
@@ -120,8 +126,10 @@ impl Relay {
         }
         let mut claims = self.claims.lock().unwrap();
         match claims.get(id) {
-            Some(h) if *h == sha(secret) => Ok(()),
+            Some(h) if constant_time_eq(h.as_bytes(), sha(secret).as_bytes()) => Ok(()),
             Some(_) => bail!("host id '{id}' is registered to another host"),
+            None if !may_claim => bail!("unknown host id"),
+            None if claims.len() >= MAX_CLAIMS => bail!("this relay is full"),
             None => {
                 claims.insert(id.to_string(), sha(secret));
                 drop(claims);
@@ -134,6 +142,9 @@ impl Relay {
 
     fn client_allowed(&self, ip: IpAddr) -> bool {
         let mut r = self.rate.lock().unwrap();
+        if r.len() > 100_000 {
+            r.retain(|_, (_, t)| t.elapsed() <= Duration::from_secs(60));
+        }
         let e = r.entry(ip).or_insert((0, Instant::now()));
         if e.1.elapsed() > Duration::from_secs(60) {
             *e = (0, Instant::now());
@@ -299,18 +310,18 @@ fn clean(mut c: Vec<SocketAddr>) -> Vec<SocketAddr> {
 }
 
 async fn connection(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr) -> Result<()> {
-    let hello: RelayHello = tokio::time::timeout(Duration::from_secs(10), read_msg(&mut sock)).await??;
+    let hello: RelayHello = tokio::time::timeout(Duration::from_secs(10), read_msg_max(&mut sock, MAX_HELLO)).await??;
     match hello {
         RelayHello::Host { version, id, secret, key } => {
             if version != RELAY_VERSION {
                 return refuse(&mut sock, "relay protocol mismatch").await;
             }
             if let Some(required) = &relay.cli.registration_key {
-                if key.as_deref() != Some(required.as_str()) {
+                if !key.is_some_and(|k| constant_time_eq(k.as_bytes(), required.as_bytes())) {
                     return refuse(&mut sock, "registration key required").await;
                 }
             }
-            if let Err(e) = relay.verify_host(&id, &secret) {
+            if let Err(e) = relay.verify_host(&id, &secret, true) {
                 return refuse(&mut sock, &e.to_string()).await;
             }
             host_control(relay, sock, id, peer).await
@@ -328,7 +339,9 @@ async fn connection(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr) ->
             client(relay, sock, id, peer, clean(candidates), token).await
         }
         RelayHello::Accept { version, id, secret, session, candidates } => {
-            if version != RELAY_VERSION || relay.verify_host(&id, &secret).is_err() {
+            // Only a host that already registered (with the key, if one is required) may
+            // answer; this never claims a new id.
+            if version != RELAY_VERSION || relay.verify_host(&id, &secret, false).is_err() {
                 return refuse(&mut sock, "not authorised").await;
             }
             let entry = relay.pending.lock().unwrap().remove(&session);
@@ -434,4 +447,53 @@ async fn client(
         Err(e) => log::info!("{peer} <-> host {id}: closed ({e})"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay(args: &[&str]) -> Relay {
+        let state = std::env::temp_dir().join(format!("rd-relay-test-{}-{}.json", std::process::id(), token()));
+        let mut argv = vec!["rd-relay", "--state", state.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        Relay {
+            cli: Cli::parse_from(argv),
+            claims: Mutex::new(HashMap::new()),
+            online: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            rate: Mutex::new(HashMap::new()),
+            generation: Mutex::new(0),
+            allocs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn host_ids_are_claimed_once() {
+        let r = relay(&[]);
+        let secret = "a-long-enough-secret";
+        assert!(r.verify_host("office", secret, false).is_err(), "answering never claims an id");
+        assert!(r.verify_host("office", secret, true).is_ok(), "first registration claims it");
+        assert!(r.verify_host("office", secret, false).is_ok(), "then the same host may answer");
+        assert!(r.verify_host("office", "another-long-secret!", true).is_err(), "nobody else can take it");
+        assert!(r.verify_host("office", "short", true).is_err());
+        assert!(r.verify_host("bad id!", secret, true).is_err());
+        let _ = std::fs::remove_file(&r.cli.state);
+    }
+
+    #[test]
+    fn client_rate_limit() {
+        let r = relay(&["--client-rate", "3"]);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!((0..3).all(|_| r.client_allowed(ip)));
+        assert!(!r.client_allowed(ip));
+        assert!(r.client_allowed("203.0.113.8".parse().unwrap()), "other addresses are unaffected");
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
 }
