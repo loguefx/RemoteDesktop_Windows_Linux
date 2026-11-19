@@ -321,7 +321,7 @@ impl Installer {
                     ui.checkbox(&mut self.desktop, "Add a shortcut on the desktop");
                     ui.add_space(12.0);
                     let b = egui::Button::new(RichText::new(if self.already { "Update" } else { "Install" }).color(Color32::WHITE).size(16.0))
-                        .fill(Color32::from_rgb(40, 110, 200))
+                        .fill(crate::theme::ACCENT)
                         .min_size(egui::vec2(120.0, 32.0));
                     if ui.add(b).clicked() {
                         self.start(ctx);
@@ -338,7 +338,7 @@ impl Installer {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         let b = egui::Button::new(RichText::new("Remove").color(Color32::WHITE).size(16.0))
-                            .fill(Color32::from_rgb(190, 60, 50))
+                            .fill(crate::theme::DANGER)
                             .min_size(egui::vec2(110.0, 32.0));
                         if ui.add(b).clicked() {
                             self.start(ctx);
@@ -363,7 +363,7 @@ impl Installer {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         let b = egui::Button::new(RichText::new("Open RD Remote Desktop").color(Color32::WHITE).size(16.0))
-                            .fill(Color32::from_rgb(40, 110, 200))
+                            .fill(crate::theme::ACCENT)
                             .min_size(egui::vec2(180.0, 32.0));
                         if ui.add(b).clicked() {
                             let _ = std::process::Command::new(installed_app()).current_dir(install_dir()).spawn();
@@ -384,7 +384,7 @@ impl Installer {
                 State::Failed(e) => {
                     ui.label(RichText::new(if installing { "It wasn't installed." } else { "It wasn't removed." }).strong().size(16.0));
                     ui.add_space(4.0);
-                    ui.label(RichText::new(e).color(Color32::from_rgb(230, 90, 80)));
+                    ui.label(RichText::new(e).color(crate::theme::DANGER));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new(RichText::new("Try again").size(16.0)).min_size(egui::vec2(100.0, 32.0))).clicked() {

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use crate::proto::{ClipData, ClipFile, ClipImage, MAX_CLIP_FILE_BYTES, MAX_CLIP_FILE_ENTRIES, MAX_CLIP_PIXELS};
+use crate::proto::{portable_name, portable_path, ClipData, ClipFile, ClipImage, MAX_CLIP_FILE_BYTES, MAX_CLIP_FILE_ENTRIES, MAX_CLIP_PIXELS};
 
 /// Encode RGBA8 pixels as PNG.
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
@@ -128,6 +128,8 @@ fn read(cb: &mut arboard::Clipboard) -> Option<(Seen, Local)> {
 }
 
 /// Read copied files and folders (recursively, not following links) within the limits.
+/// Names are made [portable](portable_name), so a name Windows can't hold doesn't stop
+/// the copy.
 pub fn collect_files(paths: &[PathBuf]) -> Result<Vec<ClipFile>> {
     let mut out = Vec::new();
     let mut bytes = 0u64;
@@ -135,7 +137,7 @@ pub fn collect_files(paths: &[PathBuf]) -> Result<Vec<ClipFile>> {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             bail!("{} has no usable name", p.display());
         };
-        add_entry(p, name.to_string(), &mut out, &mut bytes)?;
+        add_entry(p, portable_name(name), &mut out, &mut bytes)?;
     }
     Ok(out)
 }
@@ -151,7 +153,7 @@ fn add_entry(p: &Path, rel: String, out: &mut Vec<ClipFile>, bytes: &mut u64) ->
         children.sort_by_key(|e| e.file_name());
         for e in children {
             if let Some(n) = e.file_name().to_str() {
-                add_entry(&e.path(), format!("{rel}/{n}"), out, bytes)?;
+                add_entry(&e.path(), format!("{rel}/{}", portable_name(n)), out, bytes)?;
             }
         }
     } else if meta.is_file() {
@@ -352,12 +354,31 @@ fn run(rx: Receiver<ClipData>, stop: Arc<AtomicBool>, announce_initial: bool, mu
     }
 }
 
-fn apply(cb: &mut arboard::Clipboard, data: ClipData) -> Result<()> {
+/// Line endings as this system expects them: `\r\n` on Windows, `\n` elsewhere. Text
+/// copied on Windows otherwise brings a stray `\r` to the end of every line on Linux
+/// (which breaks commands pasted into a terminal), and Linux text pastes as one long
+/// line into older Windows programs.
+fn to_line_endings(text: &str, crlf: bool) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
+fn apply(cb: &mut arboard::Clipboard, mut data: ClipData) -> Result<()> {
+    // Names from an older peer may not have been made portable when they were copied.
+    if let ClipData::Files(files) = &mut data {
+        for f in files.iter_mut() {
+            f.path = portable_path(&f.path);
+        }
+    }
     if !data.within_limits() {
         bail!("clipboard content too large");
     }
     match data {
-        ClipData::Text(t) => cb.set_text(t)?,
+        ClipData::Text(t) => cb.set_text(to_line_endings(&t, cfg!(windows)))?,
         ClipData::Image(img) => {
             let (w, h, rgba) = decode_png(&img.png)?;
             cb.set_image(arboard::ImageData { width: w as usize, height: h as usize, bytes: rgba.into() })?;
@@ -417,6 +438,42 @@ mod tests {
         assert!(ClipFile { path: "ok dir/file.txt".into(), is_dir: false, data: vec![] }.path_is_safe());
         let big = ClipFile { path: "big".into(), is_dir: false, data: vec![0; MAX_CLIP_FILE_BYTES as usize + 1] };
         assert!(!ClipData::Files(vec![big]).within_limits());
+    }
+
+    #[test]
+    fn line_endings_follow_the_system() {
+        assert_eq!(to_line_endings("a\r\nb\r\n", false), "a\nb\n");
+        assert_eq!(to_line_endings("a\nb\n", true), "a\r\nb\r\n");
+        assert_eq!(to_line_endings("a\r\nb\nc", true), "a\r\nb\r\nc");
+        assert_eq!(to_line_endings("one line", true), "one line");
+    }
+
+    #[test]
+    fn names_windows_cannot_hold_are_renamed() {
+        assert_eq!(portable_name("notes: 2024?.txt"), "notes_ 2024_.txt");
+        assert_eq!(portable_name("a<b>c\"d|e*f\\g"), "a_b_c_d_e_f_g");
+        assert_eq!(portable_name("nul.txt"), "_nul.txt");
+        assert_eq!(portable_name("COM3"), "_COM3");
+        assert_eq!(portable_name("plain.txt"), "plain.txt");
+        assert_eq!(portable_name(".."), "..");
+        assert_eq!(portable_path("dir:1/con/ok"), "dir_1/_con/ok");
+        let f = ClipFile { path: portable_path("what?/why:.txt"), is_dir: false, data: vec![] };
+        assert!(f.path_is_safe());
+        assert!(!ClipFile { path: portable_path("../x"), is_dir: false, data: vec![] }.path_is_safe());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_files_with_odd_names() {
+        let src = std::env::temp_dir().join(format!("rd-clip-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("a:b")).unwrap();
+        std::fs::write(src.join("a:b/what?.txt"), b"x").unwrap();
+        let files = collect_files(&[src.join("a:b")]).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a_b", "a_b/what_.txt"]);
+        assert!(ClipData::Files(files).within_limits());
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]

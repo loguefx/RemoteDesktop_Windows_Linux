@@ -33,7 +33,7 @@ use crate::discover::{self, Found};
 use crate::setup::{self, SetupRequest};
 use crate::keymap;
 use crate::session::{self, Direction, TransferState};
-use crate::{keyhook, pads, update};
+use crate::{keyhook, pads, theme, update};
 
 // ======================================================================== app state
 
@@ -183,6 +183,8 @@ struct AdminView {
     my_password: String,
     my_pin: String,
     reset: Option<(String, String)>,
+    /// "Remove" was clicked for this user; waiting for the confirmation.
+    confirm_remove: Option<String>,
     message: Option<(bool, String)>,
     pending: Vec<(Purpose, AdminReply)>,
     /// Setting up two-step sign-in: (secret, otpauth link), and the code typed.
@@ -449,6 +451,7 @@ impl Gui {
                         my_password: String::new(),
                         my_pin: String::new(),
                         reset: None,
+                        confirm_remove: None,
                         message: None,
                         pending: vec![],
                         totp: None,
@@ -585,6 +588,17 @@ impl Gui {
                 v.pads = None;
                 return true;
             }
+            // F11 leaves full screen even while the keyboard goes to the remote computer
+            // (otherwise the remote side swallows it and the hint on the button is a lie).
+            if v.fullscreen && k.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F11) {
+                if k.state == ElementState::Pressed && !k.repeat {
+                    v.fullscreen = false;
+                    v.bar_shown = false;
+                    self.pending_fullscreen = Some(false);
+                    self.ctx.request_repaint();
+                }
+                return true;
+            }
         }
         if v.gaming {
             // Relative motion comes from raw device events (App::device_event).
@@ -683,42 +697,28 @@ impl Gui {
         self.poll_admin_task();
         self.sync_clipboard();
         self.maybe_scan();
-        // Message bars first: egui panels must be added before the central area.
-        if let Some((msg, at)) = &self.notice {
-            if at.elapsed() > Duration::from_secs(8) {
-                self.notice = None;
-            } else {
-                let msg = msg.clone();
-                egui::TopBottomPanel::top("notice").show(ctx, |ui| {
-                    ui.colored_label(Color32::from_rgb(90, 170, 90), msg);
-                });
-                ctx.request_repaint_after(Duration::from_secs(1));
-            }
-        }
-        if let Some((msg, at)) = &self.toast {
-            if at.elapsed() > Duration::from_secs(8) {
-                self.toast = None;
-            } else {
-                let msg = msg.clone();
-                egui::TopBottomPanel::top("toast").show(ctx, |ui| {
-                    ui.colored_label(Color32::from_rgb(230, 90, 90), msg);
-                });
-                ctx.request_repaint_after(Duration::from_secs(1));
-            }
-        }
+        // Messages float above the bottom edge and fade on their own (click to dismiss).
+        show_toast(ctx, &mut self.notice, theme::SUCCESS, "notice", 0.0);
+        let lift = if self.notice.is_some() { 56.0 } else { 0.0 };
+        show_toast(ctx, &mut self.toast, theme::DANGER, "toast", lift);
         if matches!(self.screen, Screen::Home) {
             let release = self.update.lock().unwrap().clone();
             if let Some(r) = release {
                 let mut go = false;
-                egui::TopBottomPanel::top("update").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Version {} is available.", r.version));
-                        if r.asset.is_some() {
-                            go = ui.button("Update now").on_hover_text("Downloads it, checks it, and updates the app and this computer's service").clicked();
-                        }
-                        ui.hyperlink_to("Release notes", &r.page);
+                egui::TopBottomPanel::top("update")
+                    .frame(egui::Frame::new().fill(theme::ACCENT.gamma_multiply(0.18)).inner_margin(egui::Margin::symmetric(16, 8)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Version {} is available.", r.version)).strong());
+                            if r.asset.is_some() {
+                                go = ui
+                                    .add(theme::primary("Update now"))
+                                    .on_hover_text("Downloads it, checks it, and updates the app and this computer's service")
+                                    .clicked();
+                            }
+                            ui.hyperlink_to("Release notes", &r.page);
+                        });
                     });
-                });
                 if go {
                     let rt = self.rt.clone();
                     let busy = if cfg!(windows) {
@@ -753,11 +753,23 @@ impl Gui {
             },
             Screen::Busy(msg) => {
                 let msg = msg.clone();
+                // A connection attempt can be abandoned; an elevated setup task can't.
+                let cancellable = self.pending.is_some();
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() / 3.0);
-                        ui.spinner();
-                        ui.label(msg);
+                        ui.add(egui::Spinner::new().size(32.0).color(theme::ACCENT));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(msg).size(16.0));
+                        if cancellable {
+                            ui.add_space(16.0);
+                            if ui.button("Cancel").clicked() {
+                                // Dropping the receiver abandons the attempt's result.
+                                self.pending = None;
+                                self.attempt = None;
+                                next = Some(Screen::Home);
+                            }
+                        }
                     });
                 });
             }
@@ -765,24 +777,34 @@ impl Gui {
                 let fp = fingerprint.clone();
                 let target = self.attempt.as_ref().map(|a| a.target.label()).unwrap_or_default();
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(60.0);
-                        ui.heading("New host");
-                        ui.add_space(8.0);
-                        ui.label(format!("This is the first time you connect to {target}."));
-                        ui.label("Check that this fingerprint matches `rd-host info` on that computer:");
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(&fp).monospace().strong());
-                        ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Trust and continue").clicked() {
-                                if let Some(a) = self.attempt.take() {
-                                    new_attempt = Some((a, Some(fp.clone())));
+                    ui.add_space(60.0);
+                    dialog(ui, 480.0, |ui| {
+                        theme::card().show(ui, |ui| {
+                            ui.heading("Is this the right computer?");
+                            ui.add_space(4.0);
+                            ui.label(format!("This is the first time you connect to {target}."));
+                            ui.add_space(8.0);
+                            ui.label(theme::hint("Check that this fingerprint matches what `rd-host info` shows on that computer:"));
+                            egui::Frame::new()
+                                .fill(theme::BG)
+                                .corner_radius(6)
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.add(egui::Label::new(RichText::new(&fp).monospace().strong()).wrap());
+                                });
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if ui.add(theme::primary("Trust and continue")).clicked() {
+                                    if let Some(a) = self.attempt.take() {
+                                        new_attempt = Some((a, Some(fp.clone())));
+                                    }
                                 }
-                            }
-                            if ui.button("Cancel").clicked() {
-                                next = Some(Screen::Home);
-                            }
+                                if ui.button("Cancel").clicked() {
+                                    self.attempt = None;
+                                    next = Some(Screen::Home);
+                                }
+                            });
                         });
                     });
                 });
@@ -988,6 +1010,50 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
+/// A message card floating above the bottom of the window, gone after 8 seconds or a click.
+fn show_toast(ctx: &egui::Context, slot: &mut Option<(String, Instant)>, color: Color32, id: &str, lift: f32) {
+    let Some((msg, at)) = slot.as_ref() else { return };
+    if at.elapsed() > Duration::from_secs(8) {
+        *slot = None;
+        return;
+    }
+    let r = egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -20.0 - lift])
+        .interactable(true)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::SURFACE_HI)
+                .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.6)))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(120) })
+                .show(ui, |ui| {
+                    ui.set_max_width((ctx.screen_rect().width() - 80.0).clamp(200.0, 560.0));
+                    ui.horizontal(|ui| {
+                        status_dot(ui, color);
+                        ui.add(egui::Label::new(msg.as_str()).wrap());
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        });
+    if r.inner.clicked() {
+        *slot = None;
+    }
+    ctx.request_repaint_after(Duration::from_secs(1));
+}
+
+/// A tiny folder, drawn (the UI font has no folder symbol).
+fn folder_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::hover());
+    let p = ui.painter();
+    let c = theme::WARNING;
+    p.rect_filled(egui::Rect::from_min_size(rect.min + egui::vec2(1.0, 2.0), egui::vec2(6.0, 3.0)), 1.0, c);
+    p.rect_filled(egui::Rect::from_min_max(rect.min + egui::vec2(1.0, 4.0), rect.max - egui::vec2(1.0, 1.0)), 2.0, c);
+}
+
 /// "5 minutes ago".
 fn ago(unix: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -1035,246 +1101,299 @@ fn home_ui(
 ) -> Option<HomeAction> {
     let mut out = None;
     let store = Store::load();
-    let green = Color32::from_rgb(90, 170, 90);
-    let grey = Color32::from_gray(140);
-    egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("RD Remote Desktop");
-        ui.add_space(10.0);
+    let green = theme::SUCCESS;
+    let grey = theme::MUTED;
 
-        // ---------------------------------------------------- this computer
-        ui.group(|ui| {
-            ui.set_width(ui.available_width().min(640.0));
-            ui.label(RichText::new("This computer").strong().size(16.0));
-            let me = scan.found.iter().find(|f| f.local);
-            match me {
-                Some(f) => {
-                    ui.horizontal(|ui| {
-                        status_dot(ui, green);
-                        ui.label(RichText::new(&f.announce.name).strong());
-                        ui.label("- remote access is on");
-                    });
-                    match (&f.announce.public, &f.announce.public_note) {
-                        (Some(p), note) => {
-                            ui.label(RichText::new(format!("Reachable from the internet (router forwards {p}).")).small());
-                            if let Some(n) = note {
-                                ui.label(RichText::new(format!("Note: {n}.")).small().color(Color32::from_rgb(220, 150, 60)));
-                            }
-                            ui.label("")
-                        }
-                        (None, Some(n)) => ui.label(RichText::new(format!("Only reachable on this network: {n}.")).small().color(grey)),
-                        (None, None) => ui.label(RichText::new("Checking the router...").small().color(grey)),
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.button("Change name or PIN").clicked() {
-                            let ddns = f
-                                .announce
-                                .public_name
-                                .as_deref()
-                                .and_then(|n| n.rsplit_once(':').map(|(h, _)| h))
-                                .map(|h| h.strip_suffix(setup::DUCKDNS_SUFFIX).unwrap_or(h).to_string())
-                                .unwrap_or_default();
-                            out = Some(HomeAction::OpenSetup(SetupForm {
-                                name: f.announce.name.clone(),
-                                pin: String::new(),
-                                pin2: String::new(),
-                                ddns_name: ddns.clone(),
-                                ddns_was: ddns,
-                                ddns_token: String::new(),
-                                wake_on_lan: true,
-                                ask_to_allow: f.announce.ask_to_allow,
-                                internet: f.announce.public_note.as_deref() != Some("access from the internet is turned off"),
-                                change: true,
-                                error: None,
-                            }));
-                        }
-                        if ui.button("Turn off").on_hover_text("Stop accepting remote connections to this computer").clicked() {
-                            out = Some(HomeAction::TurnOff);
-                        }
-                    });
-                }
-                None if !scan.done_once => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Checking...");
-                    });
-                }
-                None => {
-                    ui.label("Remote access is off. Set it up to connect to this computer from your other devices.");
-                    if ui.button("Set up remote access").clicked() {
-                        out = Some(HomeAction::OpenSetup(SetupForm {
-                            name: setup::default_name(),
-                            pin: String::new(),
-                            pin2: String::new(),
-                            ddns_name: String::new(),
-                            ddns_was: String::new(),
-                            ddns_token: String::new(),
-                            wake_on_lan: true,
-                            ask_to_allow: false,
-                            internet: true,
-                            change: false,
-                            error: None,
-                        }));
-                    }
-                }
-            }
+    egui::TopBottomPanel::top("header")
+        .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(20, 12)).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                app_mark(ui);
+                ui.label(RichText::new("RD Remote Desktop").size(18.0).strong().color(Color32::WHITE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(theme::hint(format!("v{}", env!("CARGO_PKG_VERSION"))));
+                });
+            });
         });
-        ui.add_space(14.0);
 
-        // ---------------------------------------------------- my computers
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("My computers").strong().size(16.0));
-            if scan.running {
-                ui.spinner();
-            }
-        });
-        ui.add_space(4.0);
-        // Saved computers, plus ones found on the network that aren't saved yet.
-        struct Row {
-            key: String,
-            /// Shown name (renamed on this device, or its own).
-            name: String,
-            /// Its own name.
-            real_name: String,
-            online: Option<Found>,
-            saved: Option<Computer>,
-        }
-        let mut rows: Vec<Row> = store
-            .computers
-            .iter()
-            .map(|(k, c)| Row {
-                key: k.clone(),
-                name: c.label().to_string(),
-                real_name: c.name.clone(),
-                online: scan.found.iter().find(|f| f.announce.fingerprint.eq_ignore_ascii_case(k)).cloned(),
-                saved: Some(c.clone()),
-            })
-            .collect();
-        for f in &scan.found {
-            let k = f.announce.fingerprint.to_ascii_lowercase();
-            if !store.computers.contains_key(&k) {
-                let n = f.announce.name.clone();
-                rows.push(Row { key: k, name: n.clone(), real_name: n, online: Some(f.clone()), saved: None });
-            }
-        }
-        rows.retain(|r| !r.online.as_ref().is_some_and(|f| f.local));
-        // A computer you tried but never got into, and that has gone away, isn't worth listing.
-        rows.retain(|r| r.online.is_some() || r.saved.as_ref().is_some_and(|c| c.auth.username.is_some()));
-        let online_names: Vec<String> =
-            rows.iter().filter(|r| r.online.is_some()).map(|r| r.real_name.to_lowercase()).collect();
-        rows.sort_by_key(|r| (r.online.is_none(), r.name.to_lowercase()));
-        if rows.is_empty() {
-            ui.label(RichText::new(if scan.done_once {
-                "No other computers yet. Set up remote access on another computer with this app; it shows up here while it is on the same network, and stays here afterwards."
-            } else {
-                "Looking for computers on your network..."
-            }).color(grey));
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for row in rows {
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width().min(640.0));
-                    ui.horizontal(|ui| {
-                        let (dot, status) = match (&row.online, &row.saved) {
-                            (Some(_), _) => (green, "Online on this network".to_string()),
-                            (None, _) if online_names.contains(&row.real_name.to_lowercase()) => {
-                                (grey, "Older setup of a computer with this name; remove it from the ... menu".to_string())
-                            }
-                            (None, Some(c)) if c.public.is_some() || c.public_name.is_some() || c.relay.is_some() => {
-                                (grey, "Not on this network; will connect over the internet".to_string())
-                            }
-                            (None, _) => (grey, "Not found on this network".to_string()),
-                        };
-                        status_dot(ui, dot);
-                        let os = row
-                            .online
-                            .as_ref()
-                            .map(|f| f.announce.os.clone())
-                            .filter(|o| !o.is_empty())
-                            .or_else(|| row.saved.as_ref().and_then(|c| c.os.clone()));
-                        os_icon(ui, os.as_deref());
-                        ui.vertical(|ui| {
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(16, 20))).show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            dialog(ui, 720.0, |ui| {
+                // ---------------------------------------------------- this computer
+                ui.label(theme::section("This computer"));
+                ui.add_space(2.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let me = scan.found.iter().find(|f| f.local);
+                    match me {
+                        Some(f) => {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&row.name).strong());
-                                if row.name != row.real_name {
-                                    ui.label(RichText::new(format!("({})", row.real_name)).small().color(grey));
+                                ui.label(RichText::new(&f.announce.name).size(17.0).strong().color(Color32::WHITE));
+                                theme::pill(ui, green, "Remote access on");
+                            });
+                            match (&f.announce.public, &f.announce.public_note) {
+                                (Some(p), note) => {
+                                    ui.label(theme::hint(format!("Reachable from the internet (router forwards {p}).")));
+                                    if let Some(n) = note {
+                                        ui.label(RichText::new(format!("Note: {n}.")).small().color(theme::WARNING));
+                                    }
+                                }
+                                (None, Some(n)) => {
+                                    ui.label(theme::hint(format!("Only reachable on this network: {n}.")));
+                                }
+                                (None, None) => {
+                                    ui.label(theme::hint("Checking the router..."));
+                                }
+                            }
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Change name or PIN").clicked() {
+                                    let ddns = f
+                                        .announce
+                                        .public_name
+                                        .as_deref()
+                                        .and_then(|n| n.rsplit_once(':').map(|(h, _)| h))
+                                        .map(|h| h.strip_suffix(setup::DUCKDNS_SUFFIX).unwrap_or(h).to_string())
+                                        .unwrap_or_default();
+                                    out = Some(HomeAction::OpenSetup(SetupForm {
+                                        name: f.announce.name.clone(),
+                                        pin: String::new(),
+                                        pin2: String::new(),
+                                        ddns_name: ddns.clone(),
+                                        ddns_was: ddns,
+                                        ddns_token: String::new(),
+                                        wake_on_lan: true,
+                                        ask_to_allow: f.announce.ask_to_allow,
+                                        internet: f.announce.public_note.as_deref() != Some("access from the internet is turned off"),
+                                        change: true,
+                                        error: None,
+                                    }));
+                                }
+                                if ui.button("Turn off").on_hover_text("Stop accepting remote connections to this computer").clicked() {
+                                    out = Some(HomeAction::TurnOff);
                                 }
                             });
-                            let auto = row.saved.as_ref().is_some_and(|c| !c.auth.tokens.is_empty());
-                            let mut line = status.clone();
-                            if auto {
-                                line.push_str(" · signs in automatically");
-                            }
-                            if let Some(t) = row.saved.as_ref().and_then(|c| c.last_connected) {
-                                line.push_str(&format!(" · last connected {}", ago(t)));
-                            }
-                            ui.label(RichText::new(line).small().color(grey));
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let saved = row.saved.is_some();
-                            if saved {
-                                ui.menu_button("...", |ui| {
-                                    let c = row.saved.as_ref().unwrap();
-                                    if row.online.is_none() && !c.macs.is_empty() {
-                                        if ui.button("Wake up").on_hover_text("Send a Wake-on-LAN signal (works on the same network as the computer)").clicked() {
-                                            let lan = c.lan.as_deref().and_then(|a| a.parse().ok());
-                                            let msg = match discover::wake(&c.macs, lan) {
-                                                Ok(_) => format!("Wake-up signal sent to {}. It can take a minute to start.", row.name),
-                                                Err(e) => format!("Couldn't send the wake-up signal: {e}"),
-                                            };
-                                            *notice = Some((msg, Instant::now()));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                    if ui.button("Rename on this device").clicked() {
-                                        *rename = Some((row.key.clone(), row.name.clone()));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Manage accounts").clicked() {
-                                        out = Some(HomeAction::Connect(Attempt {
-                                            target: Dest::Computer(row.key.clone()),
-                                            mode: Mode::Admin,
-                                            creds: Creds::Saved(None),
-                                            remember: false,
-                                        }));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Sign out on this device").clicked() {
-                                        let mut st = Store::load();
-                                        if let Some(c) = st.computers.get_mut(&row.key) {
-                                            c.auth.tokens.clear();
-                                        }
-                                        let _ = st.save();
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Remove from my computers").clicked() {
-                                        let mut st = Store::load();
-                                        st.computers.remove(&row.key);
-                                        let _ = st.save();
-                                        *notice = Some((format!("Removed {}", row.name), Instant::now()));
-                                        ui.close_menu();
-                                    }
-                                });
-                            }
-                            if ui.button("Connect").clicked() {
-                                let key = match (&row.saved, &row.online) {
-                                    (None, Some(f)) => save_found(f),
-                                    _ => row.key.clone(),
-                                };
-                                out = Some(HomeAction::Connect(Attempt {
-                                    target: Dest::Computer(key),
-                                    mode: Mode::Desktop,
-                                    creds: Creds::Saved(None),
-                                    remember: false,
+                        }
+                        None if !scan.done_once => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(theme::hint("Checking..."));
+                            });
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(setup::default_name()).size(17.0).strong().color(Color32::WHITE));
+                                theme::pill(ui, grey, "Remote access off");
+                            });
+                            ui.label(theme::hint("Set it up to connect to this computer from your other devices."));
+                            ui.add_space(6.0);
+                            if ui.add(theme::primary("Set up remote access")).clicked() {
+                                out = Some(HomeAction::OpenSetup(SetupForm {
+                                    name: setup::default_name(),
+                                    pin: String::new(),
+                                    pin2: String::new(),
+                                    ddns_name: String::new(),
+                                    ddns_was: String::new(),
+                                    ddns_token: String::new(),
+                                    wake_on_lan: true,
+                                    ask_to_allow: false,
+                                    internet: true,
+                                    change: false,
+                                    error: None,
                                 }));
                             }
-                        });
+                        }
+                    }
+                });
+                ui.add_space(22.0);
+
+                // ---------------------------------------------------- my computers
+                // Saved computers, plus ones found on the network that aren't saved yet.
+                struct Row {
+                    key: String,
+                    /// Shown name (renamed on this device, or its own).
+                    name: String,
+                    /// Its own name.
+                    real_name: String,
+                    online: Option<Found>,
+                    saved: Option<Computer>,
+                }
+                let mut rows: Vec<Row> = store
+                    .computers
+                    .iter()
+                    .map(|(k, c)| Row {
+                        key: k.clone(),
+                        name: c.label().to_string(),
+                        real_name: c.name.clone(),
+                        online: scan.found.iter().find(|f| f.announce.fingerprint.eq_ignore_ascii_case(k)).cloned(),
+                        saved: Some(c.clone()),
+                    })
+                    .collect();
+                for f in &scan.found {
+                    let k = f.announce.fingerprint.to_ascii_lowercase();
+                    if !store.computers.contains_key(&k) {
+                        let n = f.announce.name.clone();
+                        rows.push(Row { key: k, name: n.clone(), real_name: n, online: Some(f.clone()), saved: None });
+                    }
+                }
+                rows.retain(|r| !r.online.as_ref().is_some_and(|f| f.local));
+                // A computer you tried but never got into, and that has gone away, isn't worth listing.
+                rows.retain(|r| r.online.is_some() || r.saved.as_ref().is_some_and(|c| c.auth.username.is_some()));
+                let online_names: Vec<String> =
+                    rows.iter().filter(|r| r.online.is_some()).map(|r| r.real_name.to_lowercase()).collect();
+                rows.sort_by_key(|r| (r.online.is_none(), r.name.to_lowercase()));
+
+                ui.horizontal(|ui| {
+                    ui.label(theme::section("My computers"));
+                    if !rows.is_empty() {
+                        ui.label(theme::hint(rows.len().to_string()));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if scan.running {
+                            ui.add(egui::Spinner::new().size(14.0).color(grey)).on_hover_text("Looking for computers on your network");
+                        }
                     });
                 });
-            }
+                ui.add_space(2.0);
+                if rows.is_empty() {
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(8.0);
+                            if scan.done_once {
+                                ui.label(RichText::new("No other computers yet").strong());
+                                ui.label(theme::hint(
+                                    "Set up remote access on another computer with this app. It shows up here while it's on the same network, and stays here afterwards.",
+                                ));
+                            } else {
+                                ui.spinner();
+                                ui.label(theme::hint("Looking for computers on your network..."));
+                            }
+                            ui.add_space(8.0);
+                        });
+                    });
+                }
+                for row in rows {
+                    let (dot, status) = match (&row.online, &row.saved) {
+                        (Some(_), _) => (green, "Online on this network".to_string()),
+                        (None, _) if online_names.contains(&row.real_name.to_lowercase()) => {
+                            (theme::WARNING, "Older setup of a computer with this name; remove it from the ... menu".to_string())
+                        }
+                        (None, Some(c)) if c.public.is_some() || c.public_name.is_some() || c.relay.is_some() => {
+                            (theme::ACCENT, "Away; connects over the internet".to_string())
+                        }
+                        (None, _) => (grey, "Not found on this network".to_string()),
+                    };
+                    let os = row
+                        .online
+                        .as_ref()
+                        .map(|f| f.announce.os.clone())
+                        .filter(|o| !o.is_empty())
+                        .or_else(|| row.saved.as_ref().and_then(|c| c.os.clone()));
+                    theme::card().inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            status_dot(ui, dot);
+                            os_icon(ui, os.as_deref());
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&row.name).size(15.5).strong().color(Color32::WHITE));
+                                    if row.name != row.real_name {
+                                        ui.label(theme::hint(format!("({})", row.real_name)));
+                                    }
+                                });
+                                let auto = row.saved.as_ref().is_some_and(|c| !c.auth.tokens.is_empty());
+                                let mut line = status.clone();
+                                if auto {
+                                    line.push_str(" · signs in automatically");
+                                }
+                                if let Some(t) = row.saved.as_ref().and_then(|c| c.last_connected) {
+                                    line.push_str(&format!(" · last connected {}", ago(t)));
+                                }
+                                ui.label(theme::hint(line));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if let Some(c) = &row.saved {
+                                    ui.menu_button(RichText::new("...").strong(), |ui| {
+                                        ui.set_min_width(200.0);
+                                        if row.online.is_none() && !c.macs.is_empty() {
+                                            if ui.button("Wake up").on_hover_text("Send a Wake-on-LAN signal (works on the same network as the computer)").clicked() {
+                                                let lan = c.lan.as_deref().and_then(|a| a.parse().ok());
+                                                let msg = match discover::wake(&c.macs, lan) {
+                                                    Ok(_) => format!("Wake-up signal sent to {}. It can take a minute to start.", row.name),
+                                                    Err(e) => format!("Couldn't send the wake-up signal: {e}"),
+                                                };
+                                                *notice = Some((msg, Instant::now()));
+                                                ui.close_menu();
+                                            }
+                                        }
+                                        if ui.button("Rename on this device").clicked() {
+                                            *rename = Some((row.key.clone(), row.name.clone()));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Manage accounts").clicked() {
+                                            out = Some(HomeAction::Connect(Attempt {
+                                                target: Dest::Computer(row.key.clone()),
+                                                mode: Mode::Admin,
+                                                creds: Creds::Saved(None),
+                                                remember: false,
+                                            }));
+                                            ui.close_menu();
+                                        }
+                                        if !c.auth.tokens.is_empty() && ui.button("Sign out on this device").clicked() {
+                                            let mut st = Store::load();
+                                            if let Some(c) = st.computers.get_mut(&row.key) {
+                                                c.auth.tokens.clear();
+                                            }
+                                            let _ = st.save();
+                                            *notice = Some((format!("Signed out of {} on this device.", row.name), Instant::now()));
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if ui.button(RichText::new("Remove from my computers").color(theme::DANGER)).clicked() {
+                                            let mut st = Store::load();
+                                            st.computers.remove(&row.key);
+                                            let _ = st.save();
+                                            *notice = Some((format!("Removed {}", row.name), Instant::now()));
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                                if ui.add(theme::primary("Connect").min_size(egui::vec2(96.0, 32.0))).clicked() {
+                                    let key = match (&row.saved, &row.online) {
+                                        (None, Some(f)) => save_found(f),
+                                        _ => row.key.clone(),
+                                    };
+                                    out = Some(HomeAction::Connect(Attempt {
+                                        target: Dest::Computer(key),
+                                        mode: Mode::Desktop,
+                                        creds: Creds::Saved(None),
+                                        remember: false,
+                                    }));
+                                }
+                            });
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
         });
     });
     rename_dialog(ctx, rename);
     out
+}
+
+/// The app's mark: a small monitor in the accent colour.
+fn app_mark(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    let p = ui.painter();
+    let screen = egui::Rect::from_min_max(rect.min + egui::vec2(1.0, 3.0), rect.max - egui::vec2(1.0, 6.0));
+    p.rect_filled(screen, 3.0, theme::ACCENT);
+    p.rect_filled(screen.shrink(2.5), 1.5, theme::SURFACE);
+    let base = rect.center_bottom();
+    p.rect_filled(egui::Rect::from_center_size(base - egui::vec2(0.0, 4.0), egui::vec2(3.0, 3.0)), 0.0, theme::ACCENT);
+    p.rect_filled(egui::Rect::from_center_size(base - egui::vec2(0.0, 1.5), egui::vec2(10.0, 2.0)), 1.0, theme::ACCENT);
 }
 
 /// "Rename on this device": a name used only in this device's list.
@@ -1293,7 +1412,7 @@ fn rename_dialog(ctx: &egui::Context, rename: &mut Option<(String, String)>) {
                 save = true;
             }
             ui.horizontal(|ui| {
-                save |= ui.button("Save").clicked();
+                save |= ui.add(theme::primary("Save")).clicked();
                 if ui.button("Use its own name").clicked() {
                     text.clear();
                     save = true;
@@ -1337,100 +1456,105 @@ fn focus_if_free(ui: &egui::Ui, r: &egui::Response) {
 /// Some(true) = set up, Some(false) = cancel.
 fn setup_ui(ctx: &egui::Context, f: &mut SetupForm) -> Option<bool> {
     let mut out = None;
-    let grey = Color32::from_gray(140);
+    let grey = theme::MUTED;
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(30.0);
-        dialog(ui, 440.0, |ui| {
-            ui.heading(if f.change { "Change name or PIN" } else { "Set up remote access" });
-            ui.add_space(6.0);
-            ui.label("Choose a name for this computer and a PIN. You'll enter the PIN when you connect to this computer from another device.");
-            ui.add_space(12.0);
-            if let Some(e) = &f.error {
-                ui.colored_label(Color32::from_rgb(230, 90, 90), e);
-                ui.add_space(6.0);
-            }
-            egui::Grid::new("setup").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(260.0).char_limit(40));
-                ui.end_row();
-                ui.label("PIN");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut f.pin).password(true).hint_text("at least 4 digits").desired_width(260.0).char_limit(12),
-                );
-                if f.pin.is_empty() {
-                    focus_if_free(ui, &r);
-                }
-                ui.end_row();
-                ui.label("Repeat PIN");
-                let r = ui.add(egui::TextEdit::singleline(&mut f.pin2).password(true).desired_width(260.0).char_limit(12));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    out = Some(true);
-                }
-                ui.end_row();
-            });
-            ui.add_space(8.0);
-            ui.checkbox(&mut f.internet, "Allow connections from outside this network");
-            ui.label(
-                RichText::new("Asks your router (UPnP) to forward a port to this computer, so your other devices can connect from anywhere.")
-                    .small()
-                    .color(grey),
-            );
-            if f.internet {
-                egui::CollapsingHeader::new("Keep working when your internet address changes (optional)")
-                    .default_open(!f.ddns_was.is_empty())
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Internet providers change home addresses now and then. A free DuckDNS name follows the change, so your devices still find this computer while away. Sign in at duckdns.org, add a name, and copy your token.")
-                                .small()
-                                .color(grey),
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(30.0);
+            dialog(ui, 480.0, |ui| {
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.heading(if f.change { "Change name or PIN" } else { "Set up remote access" });
+                    ui.add_space(6.0);
+                    ui.label(theme::hint("Choose a name for this computer and a PIN. You'll enter the PIN when you connect to this computer from another device."));
+                    ui.add_space(12.0);
+                    if let Some(e) = &f.error {
+                        theme::banner(ui, theme::DANGER, e);
+                        ui.add_space(6.0);
+                    }
+                    egui::Grid::new("setup").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(260.0).char_limit(40));
+                        ui.end_row();
+                        ui.label("PIN");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut f.pin).password(true).hint_text("at least 4 digits").desired_width(260.0).char_limit(12),
                         );
-                        egui::Grid::new("ddns").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                            ui.label("DuckDNS name");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut f.ddns_name).hint_text("myhome").desired_width(150.0));
-                                ui.label(".duckdns.org");
-                            });
-                            ui.end_row();
-                            ui.label("Token");
-                            let hint = if !f.ddns_was.is_empty() && f.ddns_name.trim() == f.ddns_was { "(unchanged)" } else { "" };
-                            ui.add(egui::TextEdit::singleline(&mut f.ddns_token).password(true).hint_text(hint).desired_width(260.0));
-                            ui.end_row();
-                        });
+                        if f.pin.is_empty() {
+                            focus_if_free(ui, &r);
+                        }
+                        ui.end_row();
+                        ui.label("Repeat PIN");
+                        let r = ui.add(egui::TextEdit::singleline(&mut f.pin2).password(true).desired_width(260.0).char_limit(12));
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            out = Some(true);
+                        }
+                        ui.end_row();
                     });
-            }
-            ui.checkbox(&mut f.wake_on_lan, "Let my other devices wake this computer from sleep (Wake-on-LAN)");
-            ui.checkbox(&mut f.ask_to_allow, "Ask me before anyone connects");
-            ui.label(
-                RichText::new("Someone at this computer must click Allow first. Leave this off to connect to it while you're away.")
-                    .small()
-                    .color(grey),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("After 5 wrong PINs, sign-in pauses for a while; after 10 the PIN is switched off until you set it again here.")
-                    .small()
-                    .color(grey),
-            );
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let label = if f.change { "Save" } else { "Set up" };
-                if ui.button(label).clicked() {
-                    out = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    out = Some(false);
-                }
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut f.internet, "Allow connections from outside this network");
+                    ui.label(
+                        RichText::new("Asks your router (UPnP) to forward a port to this computer, so your other devices can connect from anywhere.")
+                            .small()
+                            .color(grey),
+                    );
+                    if f.internet {
+                        egui::CollapsingHeader::new("Keep working when your internet address changes (optional)")
+                            .default_open(!f.ddns_was.is_empty())
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Internet providers change home addresses now and then. A free DuckDNS name follows the change, so your devices still find this computer while away. Sign in at duckdns.org, add a name, and copy your token.")
+                                        .small()
+                                        .color(grey),
+                                );
+                                egui::Grid::new("ddns").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                    ui.label("DuckDNS name");
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::TextEdit::singleline(&mut f.ddns_name).hint_text("myhome").desired_width(150.0));
+                                        ui.label(".duckdns.org");
+                                    });
+                                    ui.end_row();
+                                    ui.label("Token");
+                                    let hint = if !f.ddns_was.is_empty() && f.ddns_name.trim() == f.ddns_was { "(unchanged)" } else { "" };
+                                    ui.add(egui::TextEdit::singleline(&mut f.ddns_token).password(true).hint_text(hint).desired_width(260.0));
+                                    ui.end_row();
+                                });
+                            });
+                    }
+                    ui.checkbox(&mut f.wake_on_lan, "Let my other devices wake this computer from sleep (Wake-on-LAN)");
+                    ui.checkbox(&mut f.ask_to_allow, "Ask me before anyone connects");
+                    ui.label(
+                        RichText::new("Someone at this computer must click Allow first. Leave this off to connect to it while you're away.")
+                            .small()
+                            .color(grey),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("After 5 wrong PINs, sign-in pauses for a while; after 10 the PIN is switched off until you set it again here.")
+                            .small()
+                            .color(grey),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let label = if f.change { "Save" } else { "Set up" };
+                        if ui.add(theme::primary(label)).clicked() {
+                            out = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            out = Some(false);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(if cfg!(windows) {
+                            "Windows will ask for administrator permission to install the background service."
+                        } else {
+                            "You'll be asked for your password to install the background service."
+                        })
+                        .small()
+                        .color(grey),
+                    );
+                });
             });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(if cfg!(windows) {
-                    "Windows will ask for administrator permission to install the background service."
-                } else {
-                    "You'll be asked for your password to install the background service."
-                })
-                .small()
-                .color(grey),
-            );
         });
     });
     if out == Some(true) {
@@ -1480,79 +1604,82 @@ fn sign_in_ui(ctx: &egui::Context, f: &mut SignInForm) -> Option<Option<Attempt>
     let mut out = None;
     let label = f.target.label();
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(40.0);
-        dialog(ui, 400.0, |ui| {
-            if f.pin_only {
-                ui.heading(format!("Connect to {label}"));
-                ui.label("Enter the PIN chosen when remote access was set up on that computer.");
-            } else {
-                ui.heading(if f.mode == Mode::Admin { "Sign in to manage accounts" } else { "Sign in" });
-                ui.label(RichText::new(&label).monospace());
-            }
-            ui.add_space(12.0);
-            if let Some(m) = &f.message {
-                let m = if f.pin_only && m == "invalid username or credentials" { "Wrong PIN. Try again." } else { m.as_str() };
-                ui.colored_label(Color32::from_rgb(230, 120, 80), m);
-                ui.add_space(6.0);
-            }
-            egui::Grid::new("signin").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                if !f.pin_only {
-                    ui.label("Username");
-                    let r = ui.add(egui::TextEdit::singleline(&mut f.username).desired_width(260.0));
-                    if f.username.is_empty() {
-                        focus_if_free(ui, &r);
+        ui.add_space(60.0);
+        dialog(ui, 440.0, |ui| {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if f.pin_only {
+                    ui.heading(format!("Connect to {label}"));
+                    ui.label(theme::hint("Enter the PIN chosen when remote access was set up on that computer."));
+                } else {
+                    ui.heading(if f.mode == Mode::Admin { "Sign in to manage accounts" } else { "Sign in" });
+                    ui.label(RichText::new(&label).monospace().color(theme::MUTED));
+                }
+                ui.add_space(12.0);
+                if let Some(m) = &f.message {
+                    let m = if f.pin_only && m == "invalid username or credentials" { "Wrong PIN. Try again." } else { m.as_str() };
+                    theme::banner(ui, theme::WARNING, m);
+                    ui.add_space(6.0);
+                }
+                egui::Grid::new("signin").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    if !f.pin_only {
+                        ui.label("Username");
+                        let r = ui.add(egui::TextEdit::singleline(&mut f.username).desired_width(260.0));
+                        if f.username.is_empty() {
+                            focus_if_free(ui, &r);
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-                ui.label(if f.use_pin { "PIN" } else { "Password" });
-                let r = ui.add(egui::TextEdit::singleline(&mut f.secret).password(true).desired_width(260.0));
-                if f.secret.is_empty() && (f.pin_only || !f.username.is_empty()) {
-                    focus_if_free(ui, &r);
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    out = Some(true);
-                }
-                ui.end_row();
-                if f.need_code {
-                    ui.label("Code");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut f.code).hint_text("from your authenticator app").desired_width(260.0).char_limit(7),
-                    );
-                    if f.code.is_empty() && !f.secret.is_empty() {
+                    ui.label(if f.use_pin { "PIN" } else { "Password" });
+                    let r = ui.add(egui::TextEdit::singleline(&mut f.secret).password(true).desired_width(260.0));
+                    if f.secret.is_empty() && (f.pin_only || !f.username.is_empty()) {
                         focus_if_free(ui, &r);
                     }
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         out = Some(true);
                     }
                     ui.end_row();
+                    if f.need_code {
+                        ui.label("Code");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut f.code).hint_text("from your authenticator app").desired_width(260.0).char_limit(7),
+                        );
+                        if f.code.is_empty() && !f.secret.is_empty() {
+                            focus_if_free(ui, &r);
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            out = Some(true);
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                if !f.pin_only {
+                    ui.checkbox(&mut f.use_pin, "Sign in with my PIN");
                 }
-            });
-            ui.add_space(4.0);
-            if !f.pin_only {
-                ui.checkbox(&mut f.use_pin, "Sign in with my PIN");
-            }
-            ui.checkbox(&mut f.remember, "Don't ask again on this device");
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(if f.pin_only { "Connect" } else { "Sign in" }).clicked() {
-                    out = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    out = Some(false);
-                }
-            });
-            if matches!(f.target, Dest::Computer(_)) {
+                ui.checkbox(&mut f.remember, "Don't ask again on this device");
                 ui.add_space(10.0);
-                let other = if f.pin_only { "Use a username and password instead" } else { "Use the computer's PIN instead" };
-                if ui.link(RichText::new(other).small()).clicked() {
-                    f.pin_only = !f.pin_only;
-                    f.use_pin = f.pin_only;
-                    f.message = None;
-                    if f.pin_only {
-                        f.username.clear();
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary(if f.pin_only { "Connect" } else { "Sign in" })).clicked() {
+                        out = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        out = Some(false);
+                    }
+                });
+                if matches!(f.target, Dest::Computer(_)) {
+                    ui.add_space(10.0);
+                    let other = if f.pin_only { "Use a username and password instead" } else { "Use the computer's PIN instead" };
+                    if ui.link(RichText::new(other).small()).clicked() {
+                        f.pin_only = !f.pin_only;
+                        f.use_pin = f.pin_only;
+                        f.message = None;
+                        if f.pin_only {
+                            f.username.clear();
+                        }
                     }
                 }
-            }
+            });
         });
     });
     match out {
@@ -1586,19 +1713,22 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
 
     if let Some(why) = closed {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.heading("Session ended");
-                ui.label(why);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.add_space((ui.available_width() - 170.0).max(0.0) / 2.0);
-                    if ui.button("Reconnect").clicked() {
-                        action = Some(SessionAction::Reconnect);
-                    }
-                    if ui.button("Back").clicked() {
-                        action = Some(SessionAction::Close);
-                    }
+            ui.add_space(80.0);
+            dialog(ui, 420.0, |ui| {
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.heading("Session ended");
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(why).color(theme::MUTED)).wrap());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary("Reconnect")).clicked() {
+                            action = Some(SessionAction::Reconnect);
+                        }
+                        if ui.button("Back to my computers").clicked() {
+                            action = Some(SessionAction::Close);
+                        }
+                    });
                 });
             });
         });
@@ -1616,7 +1746,9 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
     }
 
     if !v.fullscreen {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12, 6)).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
             if let Some(a) = toolbar(ui, v, &status, &displays, current, &viewers) {
                 action = Some(a);
             }
@@ -1679,34 +1811,52 @@ fn session_ui(ctx: &egui::Context, v: &mut SessionView) -> Option<SessionAction>
 
 fn chat_panel(ctx: &egui::Context, v: &mut SessionView) {
     egui::SidePanel::right("chat").default_width(300.0).show(ctx, |ui| {
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.heading("Chat");
-            if ui.small_button("Close").clicked() {
-                v.show_chat = false;
-            }
+            ui.label(theme::section("Chat"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    v.show_chat = false;
+                }
+            });
         });
-        ui.label(RichText::new("With the person at the remote computer and anyone else connected.").small().color(Color32::GRAY));
+        ui.label(theme::hint("With the person at the remote computer and anyone else connected."));
         ui.separator();
         let lines = {
             let mut s = v.handle.state.lock().unwrap();
             s.chat_unread = 0;
             s.chat.clone()
         };
-        egui::ScrollArea::vertical().max_height(ui.available_height() - 40.0).stick_to_bottom(true).show(ui, |ui| {
-            if lines.is_empty() {
-                ui.label(RichText::new("No messages yet.").color(Color32::GRAY));
-            }
-            for (from, text) in &lines {
-                ui.label(RichText::new(from).small().color(Color32::GRAY));
-                ui.label(text);
-                ui.add_space(4.0);
-            }
-        });
+        egui::ScrollArea::vertical()
+            .max_height((ui.available_height() - 48.0).max(60.0))
+            .auto_shrink([false, true])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if lines.is_empty() {
+                    ui.label(theme::hint("No messages yet."));
+                }
+                for (from, text) in &lines {
+                    let mine = from == "You";
+                    let layout = egui::Layout::top_down(if mine { egui::Align::Max } else { egui::Align::Min });
+                    ui.with_layout(layout, |ui| {
+                        ui.label(theme::hint(from.as_str()));
+                        egui::Frame::new()
+                            .fill(if mine { theme::ACCENT.gamma_multiply(0.35) } else { theme::SURFACE_HI })
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width() * 0.85);
+                                ui.add(egui::Label::new(text.as_str()).wrap());
+                            });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
         ui.separator();
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut v.chat_input).hint_text("Message").desired_width(ui.available_width() - 60.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut v.chat_input).hint_text("Message").desired_width((ui.available_width() - 70.0).max(80.0)));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Send").clicked() || enter) && !v.chat_input.trim().is_empty() {
+            if (ui.add(theme::primary("Send")).clicked() || enter) && !v.chat_input.trim().is_empty() {
                 let text: String = v.chat_input.trim().chars().take(rd_core::proto::MAX_CHAT).collect();
                 v.chat_input.clear();
                 v.handle.state.lock().unwrap().chat.push(("You".into(), text.clone()));
@@ -1721,22 +1871,18 @@ fn chat_panel(ctx: &egui::Context, v: &mut SessionView) {
 fn connection_badge(ui: &mut egui::Ui, v: &SessionView) {
     let rtt = v.handle.state.lock().unwrap().rtt_ms;
     let (kind, color, help) = match v.route.as_str() {
-        "direct" => ("Direct · this network", Color32::from_rgb(90, 170, 90), "Connected straight to the computer on your local network."),
-        "over the internet" => ("Direct · internet", Color32::from_rgb(90, 170, 90), "Connected straight to the computer over the internet (router port forwarding)."),
-        "peer-to-peer" => ("Peer-to-peer", Color32::from_rgb(90, 170, 90), "A direct connection set up through the relay server."),
-        "relayed (UDP)" => ("Relay (UDP)", Color32::from_rgb(220, 170, 60), "Carried by the relay server; a direct path wasn't possible."),
-        _ => ("Relay", Color32::from_rgb(220, 150, 60), "Carried by the relay server over TCP; slower than a direct connection."),
+        "direct" => ("Direct · this network", theme::SUCCESS, "Connected straight to the computer on your local network."),
+        "over the internet" => ("Direct · internet", theme::SUCCESS, "Connected straight to the computer over the internet (router port forwarding)."),
+        "peer-to-peer" => ("Peer-to-peer", theme::SUCCESS, "A direct connection set up through the relay server."),
+        "relayed (UDP)" => ("Relay (UDP)", theme::WARNING, "Carried by the relay server; a direct path wasn't possible."),
+        _ => ("Relay", theme::WARNING, "Carried by the relay server over TCP; slower than a direct connection."),
     };
     let mut text = kind.to_string();
     if let Some(ms) = rtt {
         text.push_str(&format!(" · {ms} ms"));
     }
     text.push_str(&format!(" · {:.0} fps", v.fps.2));
-    let r = ui.horizontal(|ui| {
-        status_dot(ui, color);
-        ui.label(RichText::new(text).small());
-    });
-    r.response.on_hover_text(help);
+    theme::pill(ui, color, &text).on_hover_text(help);
 }
 
 /// The session toolbar (top bar, or the slide-down bar in full screen).
@@ -1751,19 +1897,34 @@ fn toolbar(
     let mut action = None;
     let perms = v.user.effective();
     ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&v.title).strong());
+                ui.label(RichText::new(&v.title).strong().color(Color32::WHITE));
                 connection_badge(ui, v);
                 ui.separator();
-                if displays.len() > 1 && perms.control {
+                if !displays.is_empty() {
                     let label = |d: &rd_core::proto::DisplayInfo| format!("{} {}x{}", d.name, d.width, d.height);
                     let cur = displays.iter().find(|d| d.index == current).map(label).unwrap_or_default();
-                    egui::ComboBox::from_id_salt("display").selected_text(cur).show_ui(ui, |ui| {
-                        for d in displays {
-                            if ui.selectable_label(d.index == current, label(d)).clicked() {
-                                v.handle.send(ClientMsg::SelectDisplay(d.index));
+                    ui.label(theme::hint("Monitor"));
+                    let why_not = if !perms.control {
+                        Some("Switching monitors needs control of the computer.")
+                    } else if displays.len() == 1 {
+                        Some(
+                            "Only one monitor is shared. On a Linux computer using Wayland, the screen-sharing \
+                             dialog there decides which monitors are shared: pick all of them the next time it asks.",
+                        )
+                    } else {
+                        None
+                    };
+                    ui.add_enabled_ui(why_not.is_none(), |ui| {
+                        egui::ComboBox::from_id_salt("display").selected_text(cur).show_ui(ui, |ui| {
+                            for d in displays {
+                                if ui.selectable_label(d.index == current, label(d)).clicked() {
+                                    v.handle.send(ClientMsg::SelectDisplay(d.index));
+                                }
                             }
-                        }
-                    });
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text(why_not.unwrap_or_default());
                 }
                 {
                     let (codec, kbps) = {
@@ -1787,7 +1948,7 @@ fn toolbar(
                         }
                     });
                     if smooth && kbps > 0 {
-                        ui.label(format!("{:.1} Mbit/s", kbps as f32 / 1000.0))
+                        ui.label(theme::hint(format!("{:.1} Mbit/s", kbps as f32 / 1000.0)))
                             .on_hover_text("Current H.264 bitrate; it adapts to the connection");
                     }
                 }
@@ -1821,13 +1982,16 @@ fn toolbar(
                 } else if ui.button("Full screen").on_hover_text("Move the pointer to the top edge for this toolbar; F11 leaves full screen").clicked() {
                     action = Some(SessionAction::Fullscreen(true));
                 }
-                if ui.button("Disconnect").clicked() {
+                if ui.add(theme::danger("Disconnect")).clicked() {
                     action = Some(SessionAction::Close);
                 }
-                ui.separator();
-                ui.label(status);
+                if !status.is_empty() {
+                    ui.separator();
+                    ui.label(theme::hint(status));
+                }
                 if viewers.len() > 1 {
-                    ui.label(format!("| connected: {}", viewers.join(", ")));
+                    ui.label(theme::hint(format!("Connected: {}", viewers.join(", "))))
+                        .on_hover_text("Everyone connected to this computer right now");
                 }
     });
     action
@@ -1847,7 +2011,7 @@ fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
         let _ = store.save();
     }
     if !control {
-        ui.label(RichText::new("The other options need control of the computer.").small().color(Color32::GRAY));
+        ui.label(theme::hint("The other options need control of the computer."));
         return;
     }
     let mut p = privacy;
@@ -1859,7 +2023,7 @@ fn more_menu(ui: &mut egui::Ui, v: &mut SessionView) {
         v.handle.send(ClientMsg::Privacy(p));
     }
     if let Some(n) = note {
-        ui.label(RichText::new(n).small().color(Color32::from_rgb(220, 150, 60)));
+        ui.label(RichText::new(n).small().color(theme::WARNING));
     }
     if ui
         .checkbox(&mut v.shortcuts, "Send system shortcuts")
@@ -1923,7 +2087,7 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
         }
     }
 
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(24))).show(ctx, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_rgb(12, 13, 16))).show(ctx, |ui| {
         let avail = ui.available_rect_before_wrap();
         let ppp = ctx.pixels_per_point();
         let px = ((avail.width() * ppp) as u32, (avail.height() * ppp) as u32);
@@ -1944,12 +2108,15 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
                     Color32::WHITE,
                 );
                 v.image_rect = Some(rect);
-                let hover = ctx.pointer_latest_pos().is_some_and(|p| rect.contains(p)) && !ctx.is_pointer_over_area();
-                v.remote_hover = hover || (v.fullscreen && ctx.pointer_latest_pos().is_some_and(|p| rect.contains(p)));
+                // Not while over the slide-down toolbar, a menu or a toast: clicks there are ours.
+                v.remote_hover = ctx.pointer_latest_pos().is_some_and(|p| rect.contains(p)) && !ctx.is_pointer_over_area();
             }
             _ => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new(status).color(Color32::LIGHT_GRAY));
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() / 2.0 - 30.0).max(0.0));
+                    ui.add(egui::Spinner::new().size(28.0).color(theme::ACCENT));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(status).color(theme::MUTED));
                 });
             }
         }
@@ -1958,7 +2125,8 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
 
 fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
     egui::SidePanel::right("files").default_width(360.0).show(ctx, |ui| {
-        ui.heading("Files on the remote computer");
+        ui.add_space(6.0);
+        ui.label(theme::section("Files on the remote computer"));
         let (dir_path, parent, entries, err, transfers) = {
             let s = v.handle.state.lock().unwrap();
             (
@@ -1985,20 +2153,20 @@ fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
                     v.handle.list_dir(parent);
                 }
             }
-            let r = ui.add(egui::TextEdit::singleline(&mut v.path_input).desired_width(180.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut v.path_input).desired_width((ui.available_width() - 50.0).max(80.0)));
             if ui.button("Go").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                 v.handle.list_dir(&v.path_input);
             }
         });
         if let Some(e) = err {
-            ui.colored_label(Color32::from_rgb(230, 90, 90), e);
+            theme::banner(ui, theme::DANGER, &e);
         }
-        if ui.button("Upload a file...").on_hover_text("Or drop files onto the window").clicked() {
+        if ui.add(theme::primary("Upload a file...")).on_hover_text("Or drop files onto the window").clicked() {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
                 v.handle.upload(path);
             }
         }
-        ui.label(RichText::new("Uploads go to the remote user's Downloads folder.").small());
+        ui.label(theme::hint("Uploads go to the remote user's Downloads folder."));
         ui.separator();
         egui::ScrollArea::vertical().max_height(ui.available_height() * 0.6).id_salt("entries").show(ui, |ui| {
             for e in &entries {
@@ -2007,13 +2175,15 @@ fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
                     let sep = if base.contains('\\') { "\\" } else { "/" };
                     let full = if base.ends_with(sep) { format!("{base}{}", e.name) } else { format!("{base}{sep}{}", e.name) };
                     if e.is_dir {
-                        if ui.link(format!("[dir] {}", e.name)).clicked() {
+                        folder_icon(ui);
+                        if ui.link(&e.name).clicked() {
                             v.path_input = full.clone();
                             v.handle.list_dir(&full);
                         }
                     } else {
+                        ui.add_space(24.0);
                         ui.label(&e.name);
-                        ui.label(RichText::new(human(e.size)).small());
+                        ui.label(theme::hint(human(e.size)));
                         if ui.small_button("Download").clicked() {
                             if let Some(local) = rfd::FileDialog::new().set_file_name(&e.name).save_file() {
                                 v.handle.download(full, e.name.clone(), e.size, local);
@@ -2027,18 +2197,21 @@ fn files_panel(ctx: &egui::Context, v: &mut SessionView) {
             ui.separator();
             ui.label(RichText::new("Transfers").strong());
             for t in transfers.iter().rev().take(8) {
-                let arrow = if t.direction == Direction::Download { "down" } else { "up" };
-                ui.label(format!("{arrow}: {}", t.name));
+                let arrow = if t.direction == Direction::Download { "Download" } else { "Upload" };
+                ui.horizontal(|ui| {
+                    ui.label(theme::hint(arrow));
+                    ui.label(&t.name);
+                });
                 match &t.state {
                     TransferState::Active => {
                         let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else { 0.0 };
                         ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", human(t.done), human(t.total))));
                     }
                     TransferState::Done(m) => {
-                        ui.label(RichText::new(m).small().color(Color32::from_rgb(110, 190, 110)));
+                        ui.label(RichText::new(m).small().color(theme::SUCCESS));
                     }
                     TransferState::Failed(m) => {
-                        ui.label(RichText::new(m).small().color(Color32::from_rgb(230, 90, 90)));
+                        ui.label(RichText::new(m).small().color(theme::DANGER));
                     }
                 }
             }
@@ -2082,193 +2255,231 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
 
     let mut leave = false;
     let is_admin = v.me.role == Role::Admin;
-    egui::TopBottomPanel::top("admin_top").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.heading(format!("Accounts - {}", v.title));
-            if ui.button("Back").clicked() {
-                leave = true;
-            }
-            if ui.button("Refresh").clicked() {
-                v.refresh();
+    egui::TopBottomPanel::top("admin_top")
+        .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(20, 12)).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("< Back").clicked() {
+                    leave = true;
+                }
+                ui.label(RichText::new("Accounts").size(18.0).strong().color(Color32::WHITE));
+                ui.label(theme::hint(&v.title));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Refresh").clicked() {
+                        v.refresh();
+                    }
+                    if !v.pending.is_empty() {
+                        ui.add(egui::Spinner::new().size(14.0).color(theme::MUTED));
+                    }
+                });
+            });
+            if let Some((ok, m)) = &v.message {
+                ui.add_space(4.0);
+                theme::banner(ui, if *ok { theme::SUCCESS } else { theme::DANGER }, m);
             }
         });
-        if let Some((ok, m)) = &v.message {
-            let color = if *ok { Color32::from_rgb(110, 190, 110) } else { Color32::from_rgb(230, 90, 90) };
-            ui.colored_label(color, m);
-        }
-    });
-    egui::CentralPanel::default().show(ctx, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(20, 16))).show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if is_admin {
-                ui.heading("Users");
-                let mut actions: Vec<(AdminRequest, String)> = Vec::new();
-                egui::Grid::new("users").striped(true).num_columns(9).show(ui, |ui| {
-                    for h in ["User", "Role", "View", "Control", "Clipboard", "Files", "PIN", "2-step", ""] {
-                        ui.label(RichText::new(h).strong());
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(theme::section("Users"));
+                    ui.add_space(4.0);
+                    let mut actions: Vec<(AdminRequest, String)> = Vec::new();
+                    egui::Grid::new("users").striped(true).num_columns(9).spacing([14.0, 6.0]).show(ui, |ui| {
+                        for h in ["User", "Role", "View", "Control", "Clipboard", "Files", "PIN", "2-step", ""] {
+                            ui.label(RichText::new(h).small().strong().color(theme::MUTED));
+                        }
+                        ui.end_row();
+                        for u in &v.users {
+                            if u.disabled {
+                                ui.label(RichText::new(format!("{} (disabled)", u.username)).color(theme::MUTED));
+                            } else {
+                                ui.label(RichText::new(&u.username).strong());
+                            }
+                            let mut role = u.role;
+                            egui::ComboBox::from_id_salt(format!("role-{}", u.username))
+                                .selected_text(role.as_str())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut role, Role::Admin, "admin");
+                                    ui.selectable_value(&mut role, Role::User, "user");
+                                });
+                            if role != u.role {
+                                actions.push((
+                                    AdminRequest::SetRole { username: u.username.clone(), role },
+                                    format!("{} is now {}", u.username, role.as_str()),
+                                ));
+                            }
+                            let mut p = u.perms;
+                            let enabled = u.role != Role::Admin;
+                            ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.view));
+                            ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.control));
+                            ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.clipboard));
+                            ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.files));
+                            if p != u.perms {
+                                actions.push((
+                                    AdminRequest::SetPermissions { username: u.username.clone(), perms: p },
+                                    format!("updated permissions of {}", u.username),
+                                ));
+                            }
+                            ui.label(if u.has_pin { "yes" } else { "no" });
+                            ui.horizontal(|ui| {
+                                ui.label(if u.has_totp { "on" } else { "off" });
+                                if u.has_totp && u.username != v.me.username && ui.small_button("Turn off").clicked() {
+                                    actions.push((
+                                        AdminRequest::TotpDisable { username: u.username.clone() },
+                                        format!("two-step sign-in turned off for {}", u.username),
+                                    ));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let label = if u.disabled { "Enable" } else { "Disable" };
+                                if ui.small_button(label).clicked() {
+                                    actions.push((
+                                        AdminRequest::SetDisabled { username: u.username.clone(), disabled: !u.disabled },
+                                        format!("{} {}", label.to_lowercase() + "d", u.username),
+                                    ));
+                                }
+                                if ui.small_button("Reset password").clicked() {
+                                    v.reset = Some((u.username.clone(), String::new()));
+                                }
+                                if u.username != v.me.username && ui.small_button(RichText::new("Remove").color(theme::DANGER)).clicked() {
+                                    v.confirm_remove = Some(u.username.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                    for (req, msg) in actions {
+                        v.request(req, Purpose::Change(msg));
+                    }
+                    if let Some(who) = v.confirm_remove.clone() {
+                        ui.add_space(4.0);
+                        theme::banner(ui, theme::DANGER, &format!("Remove {who}? Their account, PIN and remembered devices are deleted."));
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::danger(&format!("Remove {who}"))).clicked() {
+                                v.confirm_remove = None;
+                                v.request(AdminRequest::RemoveUser { username: who.clone() }, Purpose::Change(format!("removed {who}")));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                v.confirm_remove = None;
+                            }
+                        });
+                    }
+                    if let Some((who, pw)) = &mut v.reset {
+                        let who = who.clone();
+                        let mut submit = false;
+                        let mut cancel = false;
+                        ui.horizontal(|ui| {
+                            ui.label(format!("New password for {who}:"));
+                            ui.add(egui::TextEdit::singleline(pw).password(true));
+                            submit = ui.add(theme::primary("Set")).clicked();
+                            cancel = ui.button("Cancel").clicked();
+                        });
+                        if submit {
+                            let password = pw.clone();
+                            v.reset = None;
+                            v.request(
+                                AdminRequest::SetPassword { username: who.clone(), password },
+                                Purpose::Change(format!("password of {who} changed")),
+                            );
+                        } else if cancel {
+                            v.reset = None;
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.label(RichText::new("Add a user").strong());
+                    let (name, pw, admin, perms) = &mut v.new_user;
+                    let mut add = false;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(name).hint_text("username").desired_width(140.0));
+                        ui.add(egui::TextEdit::singleline(pw).hint_text("password (8+)").password(true).desired_width(140.0));
+                        ui.checkbox(admin, "admin");
+                        ui.add_enabled_ui(!*admin, |ui| {
+                            ui.checkbox(&mut perms.view, "view");
+                            ui.checkbox(&mut perms.control, "control");
+                            ui.checkbox(&mut perms.clipboard, "clipboard");
+                            ui.checkbox(&mut perms.files, "files");
+                        });
+                        add = ui.add(theme::primary("Add")).clicked();
+                    });
+                    if add {
+                        let req = AdminRequest::AddUser {
+                            username: name.trim().to_string(),
+                            password: std::mem::take(pw),
+                            role: if *admin { Role::Admin } else { Role::User },
+                            perms: *perms,
+                        };
+                        let msg = format!("added {}", name.trim());
+                        name.clear();
+                        v.request(req, Purpose::Change(msg));
+                    }
+                });
+                ui.add_space(12.0);
+            }
+
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::section("My account"));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("New password:");
+                    ui.add(egui::TextEdit::singleline(&mut v.my_password).password(true).desired_width(160.0));
+                    if ui.button("Change").clicked() {
+                        let password = std::mem::take(&mut v.my_password);
+                        let username = v.me.username.clone();
+                        v.request(
+                            AdminRequest::SetPassword { username, password },
+                            Purpose::Change("password changed (remembered devices were signed out)".into()),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Quick-login PIN:");
+                    ui.add(egui::TextEdit::singleline(&mut v.my_pin).password(true).hint_text("4-12 digits").desired_width(100.0));
+                    if ui.button("Set PIN").clicked() {
+                        let pin = Some(std::mem::take(&mut v.my_pin));
+                        let username = v.me.username.clone();
+                        v.request(AdminRequest::SetPin { username, pin }, Purpose::Change("PIN set".into()));
+                    }
+                    if ui.button("Remove PIN").clicked() {
+                        let username = v.me.username.clone();
+                        v.request(AdminRequest::SetPin { username, pin: None }, Purpose::Change("PIN removed".into()));
+                    }
+                });
+                two_step_ui(ui, v);
+            });
+            ui.add_space(12.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::section(if is_admin { "Remembered devices (all users)" } else { "My remembered devices" }));
+                ui.add_space(4.0);
+                if v.devices.is_empty() {
+                    ui.label(theme::hint("None yet. Devices appear here when someone ticks \"Don't ask again on this device\"."));
+                }
+                let mut revoke = None;
+                egui::Grid::new("devices").striped(true).num_columns(5).spacing([14.0, 6.0]).show(ui, |ui| {
+                    for h in ["User", "Device", "Added", "Last used", ""] {
+                        ui.label(RichText::new(h).small().strong().color(theme::MUTED));
                     }
                     ui.end_row();
-                    for u in &v.users {
-                        ui.label(if u.disabled { format!("{} (disabled)", u.username) } else { u.username.clone() });
-                        let mut role = u.role;
-                        egui::ComboBox::from_id_salt(format!("role-{}", u.username))
-                            .selected_text(role.as_str())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut role, Role::Admin, "admin");
-                                ui.selectable_value(&mut role, Role::User, "user");
-                            });
-                        if role != u.role {
-                            actions.push((
-                                AdminRequest::SetRole { username: u.username.clone(), role },
-                                format!("{} is now {}", u.username, role.as_str()),
-                            ));
+                    for d in &v.devices {
+                        ui.label(&d.username);
+                        ui.label(&d.name);
+                        ui.label(&d.created);
+                        ui.label(d.last_used.as_deref().unwrap_or("-"));
+                        if ui.small_button("Revoke").clicked() {
+                            revoke = Some(d.id);
                         }
-                        let mut p = u.perms;
-                        let enabled = u.role != Role::Admin;
-                        ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.view));
-                        ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.control));
-                        ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.clipboard));
-                        ui.add_enabled(enabled, egui::Checkbox::without_text(&mut p.files));
-                        if p != u.perms {
-                            actions.push((
-                                AdminRequest::SetPermissions { username: u.username.clone(), perms: p },
-                                format!("updated permissions of {}", u.username),
-                            ));
-                        }
-                        ui.label(if u.has_pin { "yes" } else { "no" });
-                        ui.horizontal(|ui| {
-                            ui.label(if u.has_totp { "on" } else { "off" });
-                            if u.has_totp && u.username != v.me.username && ui.small_button("Turn off").clicked() {
-                                actions.push((
-                                    AdminRequest::TotpDisable { username: u.username.clone() },
-                                    format!("two-step sign-in turned off for {}", u.username),
-                                ));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let label = if u.disabled { "Enable" } else { "Disable" };
-                            if ui.small_button(label).clicked() {
-                                actions.push((
-                                    AdminRequest::SetDisabled { username: u.username.clone(), disabled: !u.disabled },
-                                    format!("{} {}", label.to_lowercase() + "d", u.username),
-                                ));
-                            }
-                            if ui.small_button("Reset password").clicked() {
-                                v.reset = Some((u.username.clone(), String::new()));
-                            }
-                            if u.username != v.me.username && ui.small_button("Remove").clicked() {
-                                actions.push((
-                                    AdminRequest::RemoveUser { username: u.username.clone() },
-                                    format!("removed {}", u.username),
-                                ));
-                            }
-                        });
                         ui.end_row();
                     }
                 });
-                for (req, msg) in actions {
-                    v.request(req, Purpose::Change(msg));
-                }
-                if let Some((who, pw)) = &mut v.reset {
-                    let who = who.clone();
-                    let mut submit = false;
-                    let mut cancel = false;
-                    ui.horizontal(|ui| {
-                        ui.label(format!("New password for {who}:"));
-                        ui.add(egui::TextEdit::singleline(pw).password(true));
-                        submit = ui.button("Set").clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                    if submit {
-                        let password = pw.clone();
-                        v.reset = None;
-                        v.request(
-                            AdminRequest::SetPassword { username: who.clone(), password },
-                            Purpose::Change(format!("password of {who} changed")),
-                        );
-                    } else if cancel {
-                        v.reset = None;
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("Add a user").strong());
-                let (name, pw, admin, perms) = &mut v.new_user;
-                let mut add = false;
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(name).hint_text("username").desired_width(140.0));
-                    ui.add(egui::TextEdit::singleline(pw).hint_text("password (8+)").password(true).desired_width(140.0));
-                    ui.checkbox(admin, "admin");
-                    ui.add_enabled_ui(!*admin, |ui| {
-                        ui.checkbox(&mut perms.view, "view");
-                        ui.checkbox(&mut perms.control, "control");
-                        ui.checkbox(&mut perms.clipboard, "clipboard");
-                        ui.checkbox(&mut perms.files, "files");
-                    });
-                    add = ui.button("Add").clicked();
-                });
-                if add {
-                    let req = AdminRequest::AddUser {
-                        username: name.trim().to_string(),
-                        password: std::mem::take(pw),
-                        role: if *admin { Role::Admin } else { Role::User },
-                        perms: *perms,
-                    };
-                    let msg = format!("added {}", name.trim());
-                    name.clear();
-                    v.request(req, Purpose::Change(msg));
-                }
-                ui.separator();
-            }
-
-            ui.heading("My account");
-            ui.horizontal(|ui| {
-                ui.label("New password:");
-                ui.add(egui::TextEdit::singleline(&mut v.my_password).password(true).desired_width(160.0));
-                if ui.button("Change").clicked() {
-                    let password = std::mem::take(&mut v.my_password);
-                    let username = v.me.username.clone();
-                    v.request(
-                        AdminRequest::SetPassword { username, password },
-                        Purpose::Change("password changed (remembered devices were signed out)".into()),
-                    );
+                if let Some(id) = revoke {
+                    v.request(AdminRequest::RevokeDevice { id }, Purpose::Change(format!("revoked device {id}")));
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Quick-login PIN:");
-                ui.add(egui::TextEdit::singleline(&mut v.my_pin).password(true).hint_text("4-12 digits").desired_width(100.0));
-                if ui.button("Set PIN").clicked() {
-                    let pin = Some(std::mem::take(&mut v.my_pin));
-                    let username = v.me.username.clone();
-                    v.request(AdminRequest::SetPin { username, pin }, Purpose::Change("PIN set".into()));
-                }
-                if ui.button("Remove PIN").clicked() {
-                    let username = v.me.username.clone();
-                    v.request(AdminRequest::SetPin { username, pin: None }, Purpose::Change("PIN removed".into()));
-                }
-            });
-            two_step_ui(ui, v);
-            ui.separator();
-            ui.heading(if is_admin { "Remembered devices (all users)" } else { "My remembered devices" });
-            let mut revoke = None;
-            egui::Grid::new("devices").striped(true).num_columns(5).show(ui, |ui| {
-                for h in ["User", "Device", "Added", "Last used", ""] {
-                    ui.label(RichText::new(h).strong());
-                }
-                ui.end_row();
-                for d in &v.devices {
-                    ui.label(&d.username);
-                    ui.label(&d.name);
-                    ui.label(&d.created);
-                    ui.label(d.last_used.as_deref().unwrap_or("-"));
-                    if ui.small_button("Revoke").clicked() {
-                        revoke = Some(d.id);
-                    }
-                    ui.end_row();
-                }
-            });
-            if let Some(id) = revoke {
-                v.request(AdminRequest::RevokeDevice { id }, Purpose::Change(format!("revoked device {id}")));
-            }
         });
     });
     leave
@@ -2278,7 +2489,7 @@ fn admin_ui(ctx: &egui::Context, v: &mut AdminView) -> bool {
 fn two_step_ui(ui: &mut egui::Ui, v: &mut AdminView) {
     ui.add_space(6.0);
     ui.label(RichText::new("Two-step sign-in").strong());
-    let grey = Color32::GRAY;
+    let grey = theme::MUTED;
     if v.me.has_totp {
         ui.horizontal(|ui| {
             ui.label("On: signing in also needs a code from your authenticator app (remembered devices don't).");
@@ -2553,7 +2764,7 @@ impl App {
         unsafe {
             use glow::HasContext as _;
             let gl = self.gl.as_ref().unwrap();
-            gl.clear_color(0.1, 0.1, 0.1, 1.0);
+            gl.clear_color(19.0 / 255.0, 21.0 / 255.0, 26.0 / 255.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
         }
         eg.paint(&gw.window);
@@ -2585,6 +2796,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             })
         });
         let eg = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
+        crate::theme::apply(&eg.egui_ctx);
         let proxy = egui::mutex::Mutex::new(self.proxy.clone());
         eg.egui_ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));

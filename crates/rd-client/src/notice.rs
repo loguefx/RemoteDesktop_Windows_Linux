@@ -93,7 +93,7 @@ impl Notice {
             for (id, who) in &asks {
                 ui.label(RichText::new(format!("{who} wants to connect to this computer.")).strong());
                 ui.horizontal(|ui| {
-                    let allow = egui::Button::new(RichText::new("Allow").color(Color32::WHITE)).fill(Color32::from_rgb(60, 130, 70));
+                    let allow = egui::Button::new(RichText::new("Allow").color(Color32::WHITE)).fill(crate::theme::SUCCESS.gamma_multiply(0.8));
                     if ui.add(allow).clicked() {
                         answers.push((*id, true));
                     }
@@ -106,7 +106,7 @@ impl Notice {
             if !viewers.is_empty() {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 6.0, Color32::from_rgb(230, 120, 60));
+                    ui.painter().circle_filled(rect.center(), 6.0, crate::theme::WARNING);
                     ui.label(RichText::new("Your screen is being shared").strong().size(15.0));
                 });
                 for v in &viewers {
@@ -117,7 +117,7 @@ impl Notice {
                         ui.spinner();
                         ui.label("Disconnecting...");
                     } else {
-                        let b = egui::Button::new(RichText::new("Disconnect").color(Color32::WHITE)).fill(Color32::from_rgb(190, 60, 50));
+                        let b = egui::Button::new(RichText::new("Disconnect").color(Color32::WHITE)).fill(crate::theme::DANGER);
                         if ui.add(b).on_hover_text("End the remote session now").clicked() {
                             self.send("disconnect");
                             self.disconnecting = true;

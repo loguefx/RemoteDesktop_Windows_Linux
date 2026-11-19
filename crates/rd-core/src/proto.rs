@@ -311,6 +311,30 @@ impl ClipFile {
     }
 }
 
+/// A file name every system can write: characters Windows forbids (`\ : < > " | ? *`)
+/// and control characters become `_`, and Windows device names (`CON`, `nul.txt`) get a
+/// leading `_`. So a Linux file named `notes: 2024?.txt` pastes on Windows as
+/// `notes_ 2024_.txt` instead of failing the whole paste. `.` and `..` are left alone
+/// (they are refused later, not renamed into something else).
+pub fn portable_name(name: &str) -> String {
+    if name == "." || name == ".." {
+        return name.to_string();
+    }
+    let mut out: String = name
+        .chars()
+        .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') { '_' } else { ch })
+        .collect();
+    if is_windows_device_name(&out) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// [`portable_name`] for each component of a `/`-separated path.
+pub fn portable_path(path: &str) -> String {
+    path.split('/').map(portable_name).collect::<Vec<_>>().join("/")
+}
+
 /// `CON`, `nul.txt`, `COM1`... name devices on Windows, not files.
 fn is_windows_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();

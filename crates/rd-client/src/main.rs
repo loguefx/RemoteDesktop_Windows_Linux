@@ -27,6 +27,7 @@ mod notice;
 mod pads;
 mod session;
 mod setup;
+mod theme;
 mod update;
 
 use anyhow::{bail, Context, Result};
