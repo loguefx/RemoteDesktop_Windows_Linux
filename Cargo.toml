@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rd-core", "crates/rd-platform", "crates/rd-host", "crates/rd-client", "crates/rd-relay"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 
