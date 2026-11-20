@@ -480,6 +480,8 @@ async fn snapshot(auth: Auth, out: std::path::PathBuf, move_mouse: Option<(u32, 
     use std::time::Duration;
 
     let mut s = conn::login(&auth.host, Mode::Desktop, &auth.options()).await?;
+    // Don't lock the computer when this diagnostic disconnects.
+    write_msg(&mut s.stream, &ClientMsg::LockOnLeave(false)).await?;
     let mut dec = Decoder::default();
     let mut moved = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -575,6 +577,9 @@ async fn check(auth: Auth, o: CheckOpts) -> Result<()> {
     println!("signed in as {} ({}, permissions: {perms})", s.user.username, s.user.role.as_str());
     println!("connection: {}", s.route);
     let h = session::Handle::start(&tokio::runtime::Handle::current(), s, || {});
+    // A diagnostic run must never lock the computer when it disconnects (the host's
+    // default, meant for the app).
+    h.send(ClientMsg::LockOnLeave(false));
 
     let (w, hgt) = wait_for(&h, 30, |s| (s.decoder.width > 0).then_some((s.decoder.width, s.decoder.height))).await?;
     println!("video: {w}x{hgt}");
