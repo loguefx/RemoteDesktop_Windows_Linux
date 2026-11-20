@@ -80,8 +80,17 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
       - name: Check that H.264 has its fast code
-        # OpenH264 quietly drops its assembly when NASM fails; fail the build instead.
-        run: grep -q 'WelsDctT4_sse2' target/release/rd-host || { echo "OpenH264 was built without its SIMD code (is nasm installed?)"; exit 1; }
+        # OpenH264's build script quietly drops its assembly when NASM fails, and says so
+        # only in its build output; fail the build instead (as an annotation, so the reason
+        # shows on the run's summary page).
+        run: |
+          out=$(cat target/release/build/openh264-sys2-*/output 2>/dev/null)
+          if [ -z "$out" ]; then echo "::error::OpenH264's build output wasn't found"; exit 1; fi
+          if echo "$out" | grep -qiE 'not using any assembly|NASM compilation disabled'; then
+            echo "::error::OpenH264 was built without its SIMD code: $(echo "$out" | grep -iE 'nasm|assembly' | head -3 | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "::notice::OpenH264 built with NASM ($(nasm -v))"
       - name: Package
         run: |
           dir=dist/rd-remote-desktop-linux-x86_64
