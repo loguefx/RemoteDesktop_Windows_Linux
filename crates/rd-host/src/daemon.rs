@@ -316,7 +316,10 @@ where
     write_msg(&mut tls, &LoginResult::Ok { user: user.clone(), host_name: shared.host_name.clone(), device_token }).await?;
 
     match hello.mode {
-        Mode::Admin => admin_loop(&shared, &user, &mut tls).await,
+        Mode::Admin => {
+            let fresh = !matches!(hello.credential, Credential::DeviceToken(_));
+            admin_loop(&shared, &user, fresh, &mut tls).await
+        }
         Mode::Desktop => {
             let label = viewer_label(&user.username, &hello.device);
             let r = viewer_session(&shared, &user, label, tls).await;
@@ -1149,7 +1152,7 @@ async fn secure_attention(desk: &Desk) {
 
 // ================================================================== admin RPC
 
-async fn admin_loop<S>(shared: &Arc<Shared>, me: &UserInfo, s: &mut S) -> Result<()>
+async fn admin_loop<S>(shared: &Arc<Shared>, me: &UserInfo, fresh: bool, s: &mut S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1168,7 +1171,7 @@ where
                 Ok(Some(u)) if !u.disabled => u,
                 _ => return AdminResponse::Error("your account no longer exists or is disabled".into()),
             };
-            match admin_request(&mut db, &me, &shared2.host_name, req) {
+            match admin_request(&mut db, &me, &shared2.host_name, req, fresh) {
                 Ok(r) => r,
                 Err(e) => AdminResponse::Error(format!("{e:#}")),
             }
@@ -1178,7 +1181,22 @@ where
     }
 }
 
-fn admin_request(db: &mut Db, me: &UserInfo, host_name: &str, req: AdminRequest) -> Result<AdminResponse> {
+/// Refusal for account changes in a session that signed in with a remembered device.
+const NEEDS_FRESH_SIGN_IN: &str = "to change accounts or sign-in settings, sign in with your password or PIN \
+                                   (a remembered device isn't enough)";
+
+/// `fresh`: this session signed in with a password or PIN (and code), not a remembered
+/// device. A device token skips the two-step code, so on its own it may only look and
+/// revoke devices; otherwise a stolen token could change the password or turn two-step
+/// sign-in off and take the account over.
+fn admin_request(db: &mut Db, me: &UserInfo, host_name: &str, req: AdminRequest, fresh: bool) -> Result<AdminResponse> {
+    let read_only = matches!(
+        req,
+        AdminRequest::WhoAmI | AdminRequest::ListUsers | AdminRequest::ListDevices | AdminRequest::RevokeDevice { .. }
+    );
+    if !read_only && !fresh {
+        bail!(NEEDS_FRESH_SIGN_IN);
+    }
     let admin = me.role == Role::Admin;
     let need_admin = || -> Result<()> {
         if admin {
@@ -1276,6 +1294,28 @@ fn admin_request(db: &mut Db, me: &UserInfo, host_name: &str, req: AdminRequest)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_devices_cannot_change_accounts() {
+        let dir = std::env::temp_dir().join(format!("rd-admin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir).unwrap();
+        db.create_user("owner", "long random password", Role::Admin, Permissions::FULL).unwrap();
+        let me = db.get_user("owner").unwrap().unwrap();
+        let set_pw = || AdminRequest::SetPassword { username: "owner".into(), password: "another long password".into() };
+        // Signed in with a remembered device: may look and revoke, not change.
+        assert!(admin_request(&mut db, &me, "PC", AdminRequest::ListUsers, false).is_ok());
+        assert!(admin_request(&mut db, &me, "PC", AdminRequest::ListDevices, false).is_ok());
+        for req in [set_pw(), AdminRequest::SetPin { username: "owner".into(), pin: None }, AdminRequest::TotpDisable { username: "owner".into() }, AdminRequest::TotpSetup] {
+            let e = admin_request(&mut db, &me, "PC", req, false).err().expect("refused");
+            assert!(e.to_string().contains("password or PIN"), "{e}");
+        }
+        // Signed in with the password: allowed.
+        assert!(admin_request(&mut db, &me, "PC", set_pw(), true).is_ok());
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn tile(x: u32, y: u32, byte: u8) -> Tile {
         Tile { x, y, w: 64, h: 64, data: vec![byte] }

@@ -337,7 +337,8 @@ impl Gui {
                     secret: String::new(),
                     use_pin: computer,
                     pin_only: computer,
-                    remember: true,
+                    // Managing accounts signs in each time; don't add a remembered device.
+                    remember: attempt.mode != Mode::Admin,
                     message,
                     need_code: false,
                     code: String::new(),

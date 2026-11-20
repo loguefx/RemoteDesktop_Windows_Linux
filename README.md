@@ -415,6 +415,9 @@ Admins always have all four. When a v1 database is upgraded, accounts keep what 
   0.1% chance.
 - **Remembered devices** aren't affected by lockouts, so someone guessing PINs can't lock you out of
   your own devices.
+- **Account changes need your PIN or password:** *Manage accounts* always asks for it, even on a
+  remembered device. A remembered device alone can only view accounts and revoke remembered devices,
+  so a stolen device token can't change passwords, PINs, roles or two-step sign-in.
 - **Admin safety:** the last active admin can't be removed, demoted or disabled.
 - **Files on a Windows service install:** file access impersonates the signed-in console user. The service never reads or writes files as SYSTEM, and with nobody signed in, file transfer is refused.
 - **Audit log:** every sign-in and admin action is recorded (`rd-host info` shows the latest entries).

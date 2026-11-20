@@ -200,6 +200,14 @@ async fn sign_in(mut stream: Stream, entry: &mut HostEntry, mode: Mode, creds: C
     let (username, credential, used_token, code) = match creds {
         Creds::Saved(user) => {
             let user = user.or_else(|| entry.username.clone());
+            // Account changes need the password or PIN; the host refuses them in a session
+            // that signed in with a remembered device.
+            if mode == Mode::Admin {
+                return Ok(SignIn::NeedCredentials {
+                    username: user,
+                    message: Some("Enter your PIN or password to manage accounts.".into()),
+                });
+            }
             match user.as_deref().and_then(|u| entry.token(u).cloned()) {
                 Some(tok) => (user.unwrap(), Credential::DeviceToken(tok), true, None),
                 None => return Ok(SignIn::NeedCredentials { username: user, message: None }),
