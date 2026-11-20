@@ -7,8 +7,9 @@
 //! instead of a backlog.
 //!
 //! The bitrate adapts: when sending a frame takes much longer than a frame interval
-//! (the socket is backing up), it drops by 30%; after a few seconds without trouble it
-//! climbs again by 15% toward the configured maximum.
+//! (the socket is backing up), it drops by 30%; after a second without trouble it
+//! climbs again by 25% toward the configured maximum, so a fast home network reaches full
+//! quality within a few seconds.
 
 use std::time::{Duration, Instant};
 
@@ -64,10 +65,11 @@ impl VideoPipe {
     }
 
     /// Record how long writing a frame took. Returns the new bitrate (kbit/s) when it
-    /// changed.
-    pub fn sent(&mut self, took: Duration) -> Option<u32> {
+    /// changed. Keyframes (a new monitor, a new viewer) are many times larger than other
+    /// frames and naturally take longer to send, so they never count as congestion.
+    pub fn sent(&mut self, took: Duration, keyframe: bool) -> Option<u32> {
         let now = Instant::now();
-        let congested = took > (self.interval * 2).max(Duration::from_millis(40));
+        let congested = !keyframe && took > (self.interval * 2).max(Duration::from_millis(40));
         let old = self.enc.bitrate();
         let new = if congested {
             self.good_since = now;
@@ -78,12 +80,12 @@ impl VideoPipe {
             (old as f64 * 0.7) as u32
         } else {
             self.good_frames += 1;
-            if now - self.good_since < Duration::from_secs(3) || self.good_frames < 10 {
+            if now - self.good_since < Duration::from_secs(1) || self.good_frames < 10 {
                 return None;
             }
             self.good_since = now;
             self.good_frames = 0;
-            (old as f64 * 1.15) as u32
+            (old as f64 * 1.25) as u32
         };
         let new = new.clamp(MIN_BPS, self.max_bps);
         if new == old {
@@ -104,13 +106,15 @@ mod tests {
     fn bitrate_adapts() {
         let mut p = VideoPipe::new(8000, 30, EncoderChoice::Software).unwrap();
         assert_eq!(p.kbps(), 4000);
+        // A slow keyframe is expected, not congestion.
+        assert_eq!(p.sent(Duration::from_millis(500), true), None);
         // A stalled write cuts the rate...
-        assert_eq!(p.sent(Duration::from_millis(500)), Some(2800));
+        assert_eq!(p.sent(Duration::from_millis(500), false), Some(2800));
         // ...but not twice within half a second.
-        assert_eq!(p.sent(Duration::from_millis(500)), None);
-        // Quick writes alone don't raise it before 3 s have passed.
+        assert_eq!(p.sent(Duration::from_millis(500), false), None);
+        // Quick writes alone don't raise it before a second has passed.
         for _ in 0..20 {
-            assert_eq!(p.sent(Duration::from_millis(1)), None);
+            assert_eq!(p.sent(Duration::from_millis(1), false), None);
         }
     }
 }

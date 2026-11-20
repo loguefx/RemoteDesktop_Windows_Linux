@@ -82,7 +82,7 @@ pub fn update(data_dir: PathBuf, app: bool) -> Result<()> {
         relay: None,
         relay_only: false,
         max_viewers: get("max_viewers").and_then(|v| v.parse().ok()).unwrap_or(4),
-        video_kbps: get("video_kbps").and_then(|v| v.parse().ok()).unwrap_or(8000),
+        video_kbps: get("video_kbps").and_then(|v| v.parse().ok()).unwrap_or(20000),
         video_encoder: get("video_encoder").unwrap_or_else(|| "auto".into()),
         name: None,
         owner: None,

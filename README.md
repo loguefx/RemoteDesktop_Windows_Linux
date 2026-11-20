@@ -96,13 +96,16 @@ sudo apt install build-essential pkg-config clang \
     libpipewire-0.3-dev \
     libasound2-dev \
     libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
-# [gcc pkgconf clang pipewire-devel alsa-lib-devel libxkbcommon-devel mesa-libGL-devel mesa-libEGL-devel]
+# [gcc pkgconf clang nasm pipewire-devel alsa-lib-devel libxkbcommon-devel mesa-libGL-devel mesa-libEGL-devel]
 # Arch / CachyOS / Manjaro:
-#   sudo pacman -S --needed base-devel rustup clang pkgconf pipewire alsa-lib libxkbcommon mesa
+#   sudo pacman -S --needed base-devel rustup clang pkgconf nasm pipewire alsa-lib libxkbcommon mesa
 ```
 
 What each package is for:
 
+- `nasm`: the H.264 encoder's fast (SIMD) code. Without it the build still works, but video
+  encoding and decoding are several times slower. On Windows, install NASM and put it on `PATH`
+  before building for the same reason.
 - `libpipewire-0.3-dev`: Wayland capture on the host.
 - `libasound2-dev`: client audio playback.
 - `libxkbcommon-dev`, `libgl1-mesa-dev`, `libegl1-mesa-dev`: the client window.
@@ -191,7 +194,7 @@ Options:
 | `--backend` | `auto` | Capture backend: `auto`, `x11` or `wayland` |
 | `--fps` | `30` | Frame rate limit |
 | `--max-viewers` | `4` | Most viewers allowed on one desktop at once |
-| `--video-kbps` | `8000` | Highest H.264 bitrate per viewer, in kbit/s |
+| `--video-kbps` | `20000` | Highest H.264 bitrate per viewer, in kbit/s |
 | `--video-encoder` | `auto` | `auto` uses the GPU's hardware H.264 encoder when there is one (Windows), falling back to OpenH264; `software` always uses OpenH264 |
 | `--name NAME` | computer name | Name shown in the app |
 | `--owner USER` + `--pin-file FILE` | – | PIN-only owner account (the file is deleted after reading) |
@@ -236,12 +239,17 @@ In a session:
     show next to it when they apply.
   - **Monitor** picker: which remote monitor to show. It's greyed out, with the reason when you
     point at it, if only one monitor is shared or the account can't control the computer.
+    A wide monitor (21:9 or wider) is also listed as its halves, and a super-wide one (32:9) as
+    its thirds too, e.g. *Monitor 2: left half*. Showing one part makes text much bigger on a
+    small screen, and the host only has to send that part, so it's smoother too.
   - **Sound**, **Files** and **Chat** (with the person at the remote computer and anyone else
     connected; unread messages are counted). Each stays highlighted while it's on.
   - **View:**
     - **Monitor** (also here when the window is too narrow for the picker).
-    - **Picture size:** *Fit to the window*, or *Actual size* (one remote pixel per screen pixel,
-      with scroll bars). Remembered.
+    - **Picture size:** *Fit to the window*; *Fill the height* (as tall as the window, wider than
+      it: handy for a wide monitor on a laptop); or *Zoom* at 50%, 75%, 100% (actual size, one
+      remote pixel per screen pixel), 150% or 200%. When the picture is larger than the window,
+      move the pointer to an edge to scroll that way, or use the scroll bars. Remembered.
     - **Change its resolution to fit this window:** the remote screen switches to its largest
       resolution that fits your window, for sharp, unscaled text. The original comes back when you
       disconnect. Windows and X11 (the modes the monitor offers); not on Wayland. Remembered.

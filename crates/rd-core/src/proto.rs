@@ -227,6 +227,82 @@ pub struct DisplayInfo {
     pub primary: bool,
 }
 
+/// One slice of a wide monitor, offered as a monitor of its own: slice `k` of `n` equal
+/// side-by-side slices of monitor `parent`. On a small screen a half or third of an
+/// ultrawide is far easier to read than the whole thing shrunk to fit, and it's cheaper
+/// to encode. The host appends these after the real monitors; they're marked by their
+/// name (`part:PARENT:K:N`) so the message format stays the same for older apps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPart {
+    pub parent: u32,
+    pub k: u32,
+    pub n: u32,
+}
+
+impl DisplayPart {
+    /// The slice's left edge and width within a picture `width` pixels wide (even
+    /// numbers, so H.264 can encode it).
+    pub fn span(&self, width: u32) -> (u32, u32) {
+        let edge = |k: u32| if k >= self.n { width } else { (width as u64 * k as u64 / self.n as u64) as u32 & !1 };
+        let (a, b) = (edge(self.k), edge(self.k + 1));
+        (a, b.saturating_sub(a))
+    }
+
+    /// "left half", "middle third", ...
+    pub fn describe(&self) -> String {
+        let pos = match (self.k, self.n) {
+            (0, _) => "left",
+            (k, n) if k + 1 == n => "right",
+            _ if self.n == 3 => "middle",
+            _ => "",
+        };
+        let size = match self.n {
+            2 => "half".to_string(),
+            3 => "third".to_string(),
+            n => format!("part {} of {n}", self.k + 1),
+        };
+        if pos.is_empty() || self.n > 3 { size } else { format!("{pos} {size}") }
+    }
+}
+
+impl DisplayInfo {
+    /// Which slice of a wide monitor this is, if it is one.
+    pub fn part(&self) -> Option<DisplayPart> {
+        let mut it = self.name.strip_prefix("part:")?.split(':').map(|s| s.parse::<u32>().ok());
+        let (parent, k, n) = (it.next()??, it.next()??, it.next()??);
+        (n >= 2 && k < n).then_some(DisplayPart { parent, k, n })
+    }
+}
+
+/// The real monitors followed by halves of every wide monitor (21:9 and wider) and,
+/// for super-wide ones (32:9), thirds as well.
+pub fn with_display_parts(real: &[DisplayInfo]) -> Vec<DisplayInfo> {
+    let mut out: Vec<DisplayInfo> = real.to_vec();
+    for d in real {
+        if d.height == 0 || d.part().is_some() {
+            continue;
+        }
+        let ratio = d.width as f32 / d.height as f32;
+        let splits: &[u32] = if ratio >= 3.0 { &[2, 3] } else if ratio >= 2.1 { &[2] } else { &[] };
+        for &n in splits {
+            for k in 0..n {
+                let p = DisplayPart { parent: d.index, k, n };
+                let (x, w) = p.span(d.width);
+                out.push(DisplayInfo {
+                    index: out.len() as u32,
+                    name: format!("part:{}:{k}:{n}", d.index),
+                    x: d.x + x as i32,
+                    y: d.y,
+                    width: w,
+                    height: d.height,
+                    primary: false,
+                });
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
@@ -601,4 +677,37 @@ pub enum AgentEvent {
     /// The person at the computer answered request `id`.
     Answer { id: u32, allow: bool },
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(index: u32, x: i32, width: u32, height: u32) -> DisplayInfo {
+        DisplayInfo { index, name: format!("M{index}"), x, y: 0, width, height, primary: index == 0 }
+    }
+
+    #[test]
+    fn wide_monitors_get_parts() {
+        let list = with_display_parts(&[mon(0, 0, 1920, 1080), mon(1, 1920, 3440, 1440), mon(2, 5360, 5120, 1440)]);
+        // 16:9 none, 21:9 halves, 32:9 halves and thirds.
+        assert_eq!(list.len(), 3 + 2 + 5);
+        for (i, d) in list.iter().enumerate() {
+            assert_eq!(d.index, i as u32);
+        }
+        let parts: Vec<DisplayPart> = list[3..].iter().map(|d| d.part().unwrap()).collect();
+        assert_eq!(parts[0], DisplayPart { parent: 1, k: 0, n: 2 });
+        assert_eq!(parts[6], DisplayPart { parent: 2, k: 2, n: 3 });
+        assert_eq!((list[4].x, list[4].width), (1920 + 1720, 1720));
+        // Thirds of 5120 cover it exactly, with even edges.
+        let spans: Vec<(u32, u32)> = (0..3).map(|k| DisplayPart { parent: 2, k, n: 3 }.span(5120)).collect();
+        assert_eq!(spans, vec![(0, 1706), (1706, 1706), (3412, 1708)]);
+        assert!(list[..3].iter().all(|d| d.part().is_none()));
+        assert_eq!(parts[0].describe(), "left half");
+        assert_eq!(parts[3].describe(), "right half");
+        assert_eq!(parts[5].describe(), "middle third");
+        assert_eq!(parts[6].describe(), "right third");
+        // Parts aren't split again.
+        assert_eq!(with_display_parts(&list[3..4]).len(), 1);
+    }
 }

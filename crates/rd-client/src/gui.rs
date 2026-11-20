@@ -161,8 +161,10 @@ struct SessionView {
     /// The remote computer's name, and its OS (`windows` / `linux`) when known.
     host_name: String,
     remote_os: Option<String>,
-    /// Show the picture at its actual size (1:1) instead of fitting it to the window.
-    actual_size: bool,
+    /// How big the picture is shown.
+    size: PictureSize,
+    /// Scroll position of a picture larger than the window (moved by edge panning).
+    pan: Option<egui::Vec2>,
     /// The part of the picture visible in the window (in actual size it can be scrolled).
     image_clip: Option<egui::Rect>,
     /// Connection details shown over the picture.
@@ -441,7 +443,8 @@ impl Gui {
                         pads: None,
                         host_name,
                         remote_os,
-                        actual_size: store.actual_size,
+                        size: PictureSize::load(&store),
+                        pan: None,
                         image_clip: None,
                         show_stats: store.show_stats,
                         flash: None,
@@ -1934,9 +1937,46 @@ fn connection_badge(ui: &mut egui::Ui, v: &SessionView, compact: bool) {
     theme::pill(ui, color, &parts.join(" · ")).on_hover_text(format!("{kind}\n{help}"));
 }
 
+/// How big the remote picture is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PictureSize {
+    /// The whole picture, as large as fits.
+    Fit,
+    /// As tall as the window, scrolled sideways (a wide monitor on a small screen).
+    FillHeight,
+    /// A percentage of the actual size (100 = one remote pixel per screen pixel).
+    Zoom(u32),
+}
+
+impl PictureSize {
+    fn load(store: &Store) -> Self {
+        match store.picture_size.as_deref() {
+            Some("fit") => PictureSize::Fit,
+            Some("height") => PictureSize::FillHeight,
+            Some(z) => z.parse().ok().filter(|z| (10..=400).contains(z)).map(PictureSize::Zoom).unwrap_or(PictureSize::Fit),
+            // Before zoom levels there was only "actual size".
+            None if store.actual_size => PictureSize::Zoom(100),
+            None => PictureSize::Fit,
+        }
+    }
+
+    fn save(self, store: &mut Store) {
+        store.actual_size = self == PictureSize::Zoom(100);
+        store.picture_size = Some(match self {
+            PictureSize::Fit => "fit".into(),
+            PictureSize::FillHeight => "height".into(),
+            PictureSize::Zoom(z) => z.to_string(),
+        });
+    }
+}
+
 /// "Monitor 2 (main)": the name shown for a remote monitor. Windows calls them
 /// `\\.\DISPLAY1`, which says nothing, so they're numbered instead.
 fn monitor_label(d: &rd_core::proto::DisplayInfo) -> String {
+    if let Some(p) = d.part() {
+        // A slice of a wide monitor (see rd_core::proto::DisplayPart).
+        return format!("Monitor {}: {}", p.parent + 1, p.describe());
+    }
     if d.primary {
         format!("Monitor {} (main)", d.index + 1)
     } else {
@@ -2107,20 +2147,37 @@ fn view_menu(ui: &mut egui::Ui, v: &mut SessionView, displays: &[rd_core::proto:
     }
 
     ui.label(theme::hint("Picture size"));
-    let was = v.actual_size;
-    if ui.radio(!v.actual_size, "Fit to the window").clicked() {
-        v.actual_size = false;
+    let was = v.size;
+    if ui.radio(v.size == PictureSize::Fit, "Fit to the window").clicked() {
+        v.size = PictureSize::Fit;
     }
     if ui
-        .radio(v.actual_size, "Actual size")
-        .on_hover_text("One remote pixel per screen pixel, the sharpest; drag the scroll bars to move around (the mouse wheel goes to the remote computer)")
+        .radio(v.size == PictureSize::FillHeight, "Fill the height")
+        .on_hover_text("As tall as the window and wider than it: good for a wide monitor on a small screen. Move the pointer to the left or right edge to scroll")
         .clicked()
     {
-        v.actual_size = true;
+        v.size = PictureSize::FillHeight;
     }
-    if v.actual_size != was {
+    ui.horizontal(|ui| {
+        ui.label("Zoom");
+        for pct in [50, 75, 100, 150, 200] {
+            let help = if pct == 100 {
+                "Actual size: one remote pixel per screen pixel, the sharpest".to_string()
+            } else {
+                format!("{pct}% of the actual size")
+            };
+            if ui.selectable_label(v.size == PictureSize::Zoom(pct), format!("{pct}%")).on_hover_text(help).clicked() {
+                v.size = PictureSize::Zoom(pct);
+            }
+        }
+    });
+    if v.size != PictureSize::Fit {
+        ui.label(theme::hint("Larger than the window? Move the pointer to an edge to scroll there."));
+    }
+    if v.size != was {
+        v.pan = None;
         let mut store = Store::load();
-        store.actual_size = v.actual_size;
+        v.size.save(&mut store);
         let _ = store.save();
     }
     if control
@@ -2331,13 +2388,26 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
             Some(tex) if v.remote_size.0 > 0 => {
                 let (rw, rh) = (v.remote_size.0 as f32, v.remote_size.1 as f32);
                 let tex_id = tex.id();
-                if v.actual_size {
-                    // One remote pixel per physical pixel; scroll bars when it doesn't fit.
-                    let size = egui::vec2(rw / ppp, rh / ppp);
+                if v.size != PictureSize::Fit {
                     // Solid scroll bars beside the picture, not floating over it, so a click on
                     // them never reaches the remote computer.
                     ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-                    let out = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("picture").show(ui, |ui| {
+                    let bar = ui.spacing().scroll.allocated_width();
+                    // Physical pixels per remote pixel.
+                    let k = match v.size {
+                        PictureSize::Zoom(pct) => pct as f32 / 100.0,
+                        _ => {
+                            let full = avail.height() * ppp / rh;
+                            // Leave room for the sideways scroll bar when there will be one.
+                            if rw * full > avail.width() * ppp { (avail.height() - bar) * ppp / rh } else { full }
+                        }
+                    };
+                    let size = egui::vec2((rw * k).floor() / ppp, (rh * k).floor() / ppp);
+                    let mut area = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("picture");
+                    if let Some(pan) = v.pan.take() {
+                        area = area.scroll_offset(pan);
+                    }
+                    let out = area.show(ui, |ui| {
                         let free = ui.available_size();
                         // Centre it while it's smaller than the window.
                         let pad = egui::vec2(((free.x - size.x) / 2.0).max(0.0), ((free.y - size.y) / 2.0).max(0.0));
@@ -2348,6 +2418,32 @@ fn session_picture(ctx: &egui::Context, v: &mut SessionView, status: &str) {
                     });
                     v.image_rect = Some(out.inner);
                     v.image_clip = Some(out.inner_rect);
+                    // Edge panning: with the pointer near an edge of the visible part, scroll
+                    // that way, faster the closer it gets.
+                    if let Some(p) = ctx.pointer_latest_pos().filter(|p| out.inner_rect.contains(*p) && !ctx.is_pointer_over_area()) {
+                        let r = out.inner_rect;
+                        let band = egui::vec2((r.width() * 0.06).clamp(16.0, 60.0), (r.height() * 0.06).clamp(16.0, 60.0));
+                        let push = |pos: f32, lo: f32, hi: f32, b: f32| {
+                            if pos < lo + b {
+                                -(1.0 - (pos - lo) / b)
+                            } else if pos > hi - b {
+                                1.0 - (hi - pos) / b
+                            } else {
+                                0.0
+                            }
+                        };
+                        let dir = egui::vec2(push(p.x, r.left(), r.right(), band.x), push(p.y, r.top(), r.bottom(), band.y));
+                        if dir != egui::Vec2::ZERO {
+                            let max = (out.content_size - r.size()).max(egui::Vec2::ZERO);
+                            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+                            let speed = r.size().max_elem().max(400.0) * 1.2;
+                            let next = (out.state.offset + dir * speed * dt).clamp(egui::Vec2::ZERO, max);
+                            if next != out.state.offset {
+                                v.pan = Some(next);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
                 } else {
                     let scale = (avail.width() / rw).min(avail.height() / rh);
                     // Snap to whole physical pixels so the picture isn't blurred by half-pixel offsets.

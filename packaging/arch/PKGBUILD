@@ -13,7 +13,7 @@ arch=('x86_64')
 url="https://github.com/loguefx/RemoteDesktop_Windows_Linux"
 license=('MIT')
 depends=('pipewire' 'alsa-lib' 'libxkbcommon' 'mesa' 'polkit' 'xdg-desktop-portal' 'systemd-libs')
-makedepends=('git' 'cargo' 'clang' 'pkgconf')
+makedepends=('git' 'cargo' 'clang' 'pkgconf' 'nasm')
 optdepends=('libpulse: system audio from the host (parec)'
             'networkmanager: Wake-on-LAN setup')
 provides=('rd-remote-desktop')

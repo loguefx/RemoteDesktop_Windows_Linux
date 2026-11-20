@@ -31,6 +31,9 @@ jobs:
       TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
     steps:
       - uses: actions/checkout@v4
+      # NASM lets OpenH264 build its SIMD code; without it the H.264 encoder and
+      # decoder silently fall back to plain C and run several times slower.
+      - uses: ilammy/setup-nasm@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
@@ -69,13 +72,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config clang libclang-dev \
-            libpipewire-0.3-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev libudev-dev
+            libpipewire-0.3-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev libudev-dev nasm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --release --workspace
       - name: Build
         run: cargo build --release --workspace
+      - name: Check that H.264 has its fast code
+        # OpenH264 quietly drops its assembly when NASM fails; fail the build instead.
+        run: grep -q 'WelsDctT4_sse2' target/release/rd-host || { echo "OpenH264 was built without its SIMD code (is nasm installed?)"; exit 1; }
       - name: Package
         run: |
           dir=dist/rd-remote-desktop-linux-x86_64

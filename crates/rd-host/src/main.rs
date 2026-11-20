@@ -80,7 +80,7 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         max_viewers: u32,
         /// Highest H.264 bitrate per viewer, in kbit/s (viewers that pick H.264 adapt below it).
-        #[arg(long, default_value_t = 8000)]
+        #[arg(long, default_value_t = 20000)]
         video_kbps: u32,
         /// H.264 encoder: `auto` uses the GPU's hardware encoder when there is one
         /// (falling back to OpenH264), `software` always uses OpenH264.
@@ -303,7 +303,13 @@ pub(crate) fn load_config(data_dir: PathBuf, spawn_mode: spawn::SpawnMode, agent
     let backend: Backend = get("backend").and_then(|v| v.parse().ok()).unwrap_or(Backend::Auto);
     let fps: u32 = get("fps").and_then(|v| v.parse().ok()).unwrap_or(30);
     let max_viewers: usize = get("max_viewers").and_then(|v| v.parse().ok()).unwrap_or(4);
-    let video_kbps: u32 = get("video_kbps").and_then(|v| v.parse().ok()).unwrap_or(8000).clamp(300, 100_000);
+    // 8000 was the default before 0.2.3, saved by every install; it's too low for a home
+    // network, so it's read as the new default (the bitrate still adapts to slow links).
+    let video_kbps: u32 = get("video_kbps")
+        .and_then(|v| v.parse().ok())
+        .filter(|&k| k != 8000)
+        .unwrap_or(20000)
+        .clamp(300, 100_000);
     // RD_VIDEO_ENCODER overrides the saved choice (handy for testing).
     let video_encoder = std::env::var("RD_VIDEO_ENCODER")
         .ok()

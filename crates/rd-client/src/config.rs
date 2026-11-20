@@ -30,6 +30,10 @@ pub struct Store {
     /// it to the window.
     #[serde(default)]
     pub actual_size: bool,
+    /// Picture size: "fit", "height" (fill the window's height) or a zoom percentage.
+    /// Newer than `actual_size`, which is kept in step for older versions.
+    #[serde(default)]
+    pub picture_size: Option<String>,
     /// Show the connection details over the picture.
     #[serde(default)]
     pub show_stats: bool,

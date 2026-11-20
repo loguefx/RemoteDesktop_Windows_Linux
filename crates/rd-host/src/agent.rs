@@ -4,15 +4,15 @@
 //! with a one-time token passed in `RD_AGENT_TOKEN`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rd_core::codec::Encoder;
+use rd_core::codec::{Encoder, Frame};
 use rd_core::framing::{read_msg, write_msg};
-use rd_core::proto::{AgentCmd, AgentEvent, AgentHello, FileRequest, InputEvent};
+use rd_core::proto::{AgentCmd, AgentEvent, AgentHello, DisplayInfo, DisplayPart, FileRequest, InputEvent};
 use rd_core::PROTOCOL_VERSION;
 use rd_platform::Backend;
 use tokio::net::TcpStream;
@@ -181,17 +181,25 @@ fn capture_thread(
     let mut capturer = session.capturer;
     let mut injector = session.injector;
 
+    // Left edge of the shown slice when only part of a wide monitor is shown: pointer
+    // positions from viewers are relative to the slice.
+    let crop_x = Arc::new(AtomicU32::new(0));
+
     // Input runs on its own thread so a slow capture never delays clicks/keys.
     let input_stop = stop.clone();
+    let input_crop_x = crop_x.clone();
     let input_events = events.clone();
     let resolved = session.backend;
     std::thread::Builder::new().name("input".into()).spawn(move || {
         let mut screen: Option<Box<dyn rd_platform::PrivacyScreen>> = None;
         while let Ok(cmd) = input_rx.recv() {
             match cmd {
-                InputCmd::Event(ev) => {
+                InputCmd::Event(mut ev) => {
                     if input_stop.load(Ordering::Relaxed) {
                         break;
+                    }
+                    if let InputEvent::MouseMove { x, .. } = &mut ev {
+                        *x = x.saturating_add(input_crop_x.load(Ordering::Relaxed));
                     }
                     if let Err(e) = injector.inject(&ev) {
                         log::warn!("input injection failed: {e:#}");
@@ -236,10 +244,19 @@ fn capture_thread(
         // Dropping the injector releases anything still held.
     })?;
 
-    let send_displays = |c: &dyn rd_platform::Capturer| {
-        let _ = events.send(AgentEvent::Displays { list: c.displays(), current: c.current_display() });
+    // The monitors offered to viewers: the real ones, then slices of wide ones.
+    let mut listed: Vec<DisplayInfo> = Vec::new();
+    // The slice being shown, if any (the capturer shows its whole parent monitor).
+    let mut part: Option<DisplayPart> = None;
+    let mut cropped = Frame::default();
+    let send_displays = |c: &dyn rd_platform::Capturer, listed: &mut Vec<DisplayInfo>, part: Option<DisplayPart>| {
+        *listed = rd_core::proto::with_display_parts(&c.displays());
+        let current = part
+            .and_then(|p| listed.iter().find(|d| d.part() == Some(p)).map(|d| d.index))
+            .unwrap_or(c.current_display());
+        let _ = events.send(AgentEvent::Displays { list: listed.clone(), current });
     };
-    send_displays(capturer.as_ref());
+    send_displays(capturer.as_ref(), &mut listed, part);
 
     let interval = Duration::from_secs_f64(1.0 / fps.clamp(1, 120) as f64);
     let mut encoder = Encoder::new();
@@ -251,12 +268,16 @@ fn capture_thread(
         if let Some(c) = capturer.cursor() {
             let _ = events.send(AgentEvent::Cursor(c));
         }
-        if let Some(size) = res_rx.try_iter().last() {
+        let res = res_rx.try_iter().last();
+        if let (Some(Some(_)), Some(_)) = (res, part) {
+            // A window-sized mode for the whole monitor would make no sense for a slice.
+            log::info!("not fitting the resolution while part of a monitor is shown");
+        } else if let Some(size) = res {
             match capturer.set_resolution(size) {
                 Ok((w, h)) => {
                     log::info!("display resolution now {w}x{h}");
                     encoder.force_keyframe();
-                    send_displays(capturer.as_ref());
+                    send_displays(capturer.as_ref(), &mut listed, part);
                 }
                 Err(e) => {
                     let _ = events.send(AgentEvent::Resolution(format!("Couldn't fit the resolution: {e:#}")));
@@ -264,16 +285,31 @@ fn capture_thread(
             }
         }
         if let Some(index) = display_rx.try_iter().last() {
-            match capturer.select_display(index) {
+            let want = listed.get(index as usize).and_then(|d| d.part());
+            let real = want.map(|p| p.parent).unwrap_or(index);
+            let r = if real == capturer.current_display() { Ok(()) } else { capturer.select_display(real) };
+            match r {
                 Ok(()) => {
+                    part = want;
                     encoder.force_keyframe();
-                    send_displays(capturer.as_ref());
+                    send_displays(capturer.as_ref(), &mut listed, part);
                 }
                 Err(e) => log::warn!("select display {index}: {e:#}"),
             }
         }
         let Some(frame) = capturer.capture(Duration::from_millis(100))? else {
             continue;
+        };
+        let frame = match part.map(|p| p.span(frame.width)) {
+            Some((x0, w)) if w >= 16 => {
+                crop(&mut cropped, frame, x0, w);
+                crop_x.store(x0, Ordering::Relaxed);
+                &cropped
+            }
+            _ => {
+                crop_x.store(0, Ordering::Relaxed);
+                frame
+            }
         };
         if !announced {
             announced = true;
@@ -303,6 +339,18 @@ fn capture_thread(
         last_sent = Instant::now();
     }
     Ok(())
+}
+
+/// Copy columns `x0..x0 + w` of `src` into `dst`.
+fn crop(dst: &mut Frame, src: &Frame, x0: u32, w: u32) {
+    dst.width = w;
+    dst.height = src.height;
+    dst.stride = w as usize * 4;
+    dst.data.clear();
+    let (a, b) = (x0 as usize * 4, (x0 + w) as usize * 4);
+    for y in 0..src.height {
+        dst.data.extend_from_slice(&src.row(y)[a..b]);
+    }
 }
 
 /// One-shot capture for diagnostics: `rd-host snapshot out.bmp`.

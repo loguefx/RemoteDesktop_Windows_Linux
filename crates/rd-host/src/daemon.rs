@@ -879,8 +879,9 @@ where
                                 match r {
                                     Ok(h) => {
                                         let t0 = Instant::now();
+                                        let key = h.keyframe;
                                         write_msg(&mut c_wr, &HostMsg::Video(h)).await?;
-                                        if let Some(kbps) = p.sent(t0.elapsed()) {
+                                        if let Some(kbps) = p.sent(t0.elapsed(), key) {
                                             write_msg(&mut c_wr, &HostMsg::Codec { codec, kbps }).await?;
                                         }
                                         pipe = Some(p);
