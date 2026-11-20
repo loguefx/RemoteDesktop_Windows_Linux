@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "rd-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "rd-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "rd-host"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3276,7 +3276,7 @@ dependencies = [
 
 [[package]]
 name = "rd-platform"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "rd-relay"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
