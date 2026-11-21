@@ -84,9 +84,12 @@ jobs:
         # only in its build output; fail the build instead (as an annotation, so the reason
         # shows on the run's summary page).
         run: |
+          # How fast the encoder is here (well under 10 ms per 1080p frame with SIMD).
+          speed=$(cargo test -q -p rd-core --features h264 --release encode_speed -- --ignored --nocapture 2>/dev/null | grep -E '^(screen|camera):' | tr '\n' ' ' || true)
+          echo "::notice::H.264 encoder speed: ${speed:-not measured}; SIMD symbols in rd-host: $(nm target/release/rd-host 2>/dev/null | grep -c '_sse2' || true)"
           files=$(find target -path '*/build/openh264-sys2-*/output' 2>/dev/null || true)
           if [ -z "$files" ]; then
-            echo "::warning::OpenH264's build output wasn't found, so its SIMD code couldn't be checked"
+            echo "::warning::OpenH264's build output wasn't found ($(find target -maxdepth 3 -name 'openh264*' 2>/dev/null | head -3 | tr '\n' ' ')), so its SIMD code couldn't be checked"
             exit 0
           fi
           out=$(cat $files || true)
